@@ -1,20 +1,17 @@
 import logging
+import reprlib
 import time
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Type, Union
 
-import numpy as np
 import pandas as pd
 
 from autogluon.core.learner import AbstractLearner
 from autogluon.timeseries.dataset.ts_dataframe import TimeSeriesDataFrame
-from autogluon.timeseries.evaluator import TimeSeriesEvaluator
+from autogluon.timeseries.metrics import TimeSeriesScorer, check_get_evaluation_metric
 from autogluon.timeseries.models.abstract import AbstractTimeSeriesModel
-from autogluon.timeseries.splitter import AbstractTimeSeriesSplitter, LastWindowSplitter
+from autogluon.timeseries.splitter import AbstractWindowSplitter
 from autogluon.timeseries.trainer import AbstractTimeSeriesTrainer, AutoTimeSeriesTrainer
-from autogluon.timeseries.utils.features import (
-    ContinuousAndCategoricalFeatureGenerator,
-    convert_numerical_features_to_float,
-)
+from autogluon.timeseries.utils.features import TimeSeriesFeatureGenerator
 from autogluon.timeseries.utils.forecast import get_forecast_horizon_index_ts_dataframe
 
 logger = logging.getLogger(__name__)
@@ -22,8 +19,7 @@ logger = logging.getLogger(__name__)
 
 class TimeSeriesLearner(AbstractLearner):
     """TimeSeriesLearner encompasses a full time series learning problem for a
-    training run, and keeps track of datasets, features, random seeds, and the
-    trainer object.
+    training run, and keeps track of datasets, features, and the trainer object.
     """
 
     def __init__(
@@ -31,28 +27,29 @@ class TimeSeriesLearner(AbstractLearner):
         path_context: str,
         target: str = "target",
         known_covariates_names: Optional[List[str]] = None,
-        random_state: int = 0,
         trainer_type: Type[AbstractTimeSeriesTrainer] = AutoTimeSeriesTrainer,
-        eval_metric: Optional[str] = None,
+        eval_metric: Union[str, TimeSeriesScorer, None] = None,
+        eval_metric_seasonal_period: Optional[int] = None,
         prediction_length: int = 1,
-        validation_splitter: AbstractTimeSeriesSplitter = LastWindowSplitter(),
+        cache_predictions: bool = True,
+        ensemble_model_type: Optional[Type] = None,
         **kwargs,
     ):
-        super().__init__(path_context=path_context, random_state=random_state)
-        self.eval_metric: str = TimeSeriesEvaluator.check_get_evaluation_metric(eval_metric)
+        super().__init__(path_context=path_context)
+        self.eval_metric: TimeSeriesScorer = check_get_evaluation_metric(eval_metric)
+        self.eval_metric_seasonal_period = eval_metric_seasonal_period
         self.trainer_type = trainer_type
         self.target = target
         self.known_covariates_names = [] if known_covariates_names is None else known_covariates_names
         self.prediction_length = prediction_length
-        self.quantile_levels = kwargs.get(
-            "quantile_levels",
-            kwargs.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]),
+        self.quantile_levels = kwargs.get("quantile_levels", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+        self.cache_predictions = cache_predictions
+        self.freq: Optional[str] = None
+        self.ensemble_model_type = ensemble_model_type
+
+        self.feature_generator = TimeSeriesFeatureGenerator(
+            target=self.target, known_covariates_names=self.known_covariates_names
         )
-        self.validation_splitter = validation_splitter
-        logger.info(f"Learner random seed set to {random_state}")
-        self.static_feature_pipeline = ContinuousAndCategoricalFeatureGenerator()
-        self._train_static_feature_columns: pd.Index = None
-        self._train_static_feature_dtypes: pd.Series = None
 
     def load_trainer(self) -> AbstractTimeSeriesTrainer:
         """Return the trainer object corresponding to the learner."""
@@ -81,38 +78,19 @@ class TimeSeriesLearner(AbstractLearner):
         hyperparameters: Union[str, Dict] = None,
         hyperparameter_tune_kwargs: Optional[Union[str, dict]] = None,
         time_limit: Optional[int] = None,
+        val_splitter: Optional[AbstractWindowSplitter] = None,
+        refit_every_n_windows: Optional[int] = 1,
+        random_seed: Optional[int] = None,
         **kwargs,
     ) -> None:
         self._time_limit = time_limit
         time_start = time.time()
 
-        logger.debug(
-            "Beginning AutoGluon training with TimeSeriesLearner "
-            + (f"Time limit = {time_limit}" if time_limit else "")
-        )
-        logger.info(f"AutoGluon will save models to {self.path}")
+        train_data = self.feature_generator.fit_transform(train_data)
+        if val_data is not None:
+            val_data = self.feature_generator.transform(val_data, data_frame_name="tuning_data")
 
-        logger.info(f"AutoGluon will gauge predictive performance using evaluation metric: '{self.eval_metric}'")
-        if TimeSeriesEvaluator.METRIC_COEFFICIENTS[self.eval_metric] == -1:
-            logger.info(
-                "\tThis metric's sign has been flipped to adhere to being 'higher is better'. "
-                "The reported score can be multiplied by -1 to get the metric value.",
-            )
-
-        train_data, val_data = self._preprocess_static_features(train_data=train_data, val_data=val_data)
-
-        train_data = self._preprocess_target_and_covariates(train_data, data_frame_name="train_data")
-        val_data = self._preprocess_target_and_covariates(val_data, data_frame_name="tuning_data", report_unused=False)
-
-        # Train / validation split
-        if val_data is None:
-            logger.warning(
-                "tuning_data is None. "
-                + self.validation_splitter.describe_validation_strategy(prediction_length=self.prediction_length)
-            )
-            train_data, val_data = self.validation_splitter.split(
-                ts_dataframe=train_data, prediction_length=self.prediction_length
-            )
+        self.freq = train_data.freq
 
         trainer_init_kwargs = kwargs.copy()
         trainer_init_kwargs.update(
@@ -120,168 +98,43 @@ class TimeSeriesLearner(AbstractLearner):
                 path=self.model_context,
                 prediction_length=self.prediction_length,
                 eval_metric=self.eval_metric,
+                eval_metric_seasonal_period=self.eval_metric_seasonal_period,
                 target=self.target,
                 quantile_levels=self.quantile_levels,
                 verbosity=kwargs.get("verbosity", 2),
+                skip_model_selection=kwargs.get("skip_model_selection", False),
                 enable_ensemble=kwargs.get("enable_ensemble", True),
+                metadata=self.feature_generator.covariate_metadata,
+                val_splitter=val_splitter,
+                refit_every_n_windows=refit_every_n_windows,
+                cache_predictions=self.cache_predictions,
+                ensemble_model_type=self.ensemble_model_type,
             )
         )
         self.trainer = self.trainer_type(**trainer_init_kwargs)
         self.trainer_path = self.trainer.path
         self.save()
 
+        logger.info(f"\nAutoGluon will gauge predictive performance using evaluation metric: '{self.eval_metric}'")
+        if not self.eval_metric.greater_is_better_internal:
+            logger.info(
+                "\tThis metric's sign has been flipped to adhere to being higher_is_better. The metric score can be multiplied by -1 to get the metric value."
+            )
+
+        logger.info("===================================================")
+
         self.trainer.fit(
             train_data=train_data,
             val_data=val_data,
             hyperparameters=hyperparameters,
             hyperparameter_tune_kwargs=hyperparameter_tune_kwargs,
+            excluded_model_types=kwargs.get("excluded_model_types"),
             time_limit=time_limit,
+            random_seed=random_seed,
         )
-        self.save_trainer(trainer=self.trainer)
 
         self._time_fit_training = time.time() - time_start
-
-    def _preprocess_static_features(
-        self,
-        train_data: TimeSeriesDataFrame,
-        val_data: Optional[TimeSeriesDataFrame] = None,
-    ) -> Tuple[TimeSeriesDataFrame, Optional[TimeSeriesDataFrame]]:
-        """Convert static features to categorical & float dtypes, and check if val data has compatible features.
-
-        If train_data has static features, then one of the following is guaranteed to be true:
-        - val_data is None (split will be done automatically)
-        - val_data has static features with the same columns as train_data
-
-        If train_data doesn't have static features, then one of the following is guaranteed to be true:
-        - val_data is None (split will be done automatically)
-        - val_data doesn't have static features
-        """
-        # Avoid modifying data inplace
-        train_data = train_data.copy(deep=False)
-        if val_data is not None:
-            val_data = val_data.copy(deep=False)
-
-        if train_data.static_features is None:
-            if val_data is not None and val_data.static_features is not None:
-                logger.warning(
-                    "tuning_data has static_features but train_data has no static_features. "
-                    "tuning_data.static_features will be ignored."
-                )
-                val_data.static_features = None
-        else:
-            self._train_static_feature_columns = train_data.static_features.columns
-            self._train_static_feature_dtypes = train_data.static_features.dtypes
-            train_data.static_features = self.static_feature_pipeline.fit_transform(train_data.static_features)
-            train_data.static_features = convert_numerical_features_to_float(train_data.static_features)
-
-            mapped_to_categorical = []
-            mapped_to_continuous = []
-            unused = []
-            for col_name in self._train_static_feature_columns:
-                if train_data.static_features[col_name].dtype == "category":
-                    mapped_to_categorical.append(col_name)
-                elif train_data.static_features[col_name].dtype == np.float64:
-                    mapped_to_continuous.append(col_name)
-                else:
-                    unused.append(col_name)
-
-            logger.info("Following types of static features have been inferred:")
-            logger.info(f"\tcategorical: {mapped_to_categorical}")
-            logger.info(f"\tcontinuous (float): {mapped_to_continuous}")
-            if len(unused) > 0:
-                logger.info(f"\tremoved (neither categorical nor continuous): {unused}")
-            logger.info(
-                "To learn how to fix incorrectly inferred types, please see documentation for TimeSeriesPredictor.fit "
-            )
-
-            if val_data is not None:
-                fix_message = (
-                    "Please set `tuning_data=None` to automatically generate tuning_data, or make sure that names "
-                    "and dtypes of columns in tuning_data.static_features exactly match train_data.static_features"
-                )
-                self._check_static_feature_compatibility(
-                    other_static_features=val_data.static_features, fix_message=fix_message, other_name="tuning_data"
-                )
-                val_data.static_features = val_data.static_features[self._train_static_feature_columns]
-                val_data.static_features = self.static_feature_pipeline.transform(val_data.static_features)
-                val_data.static_features = convert_numerical_features_to_float(val_data.static_features)
-
-        return train_data, val_data
-
-    def _check_static_feature_compatibility(
-        self, other_static_features: pd.DataFrame, fix_message: str, other_name: str
-    ) -> None:
-        """Make sure that given static features are compatible with training data (have same columns and dtypes)."""
-        if other_static_features is None:
-            raise ValueError(
-                f"Provided {other_name} has no static_features, but train_data has static features. " + fix_message
-            )
-        missing_columns = self._train_static_feature_columns.difference(other_static_features.columns)
-        if len(missing_columns) > 0:
-            raise ValueError(
-                f"Columns {missing_columns.to_list()} are missing in {other_name}.static_features but were present in "
-                "train_data.static_features. " + fix_message
-            )
-        different_dtype_columns = self._train_static_feature_columns[
-            other_static_features[self._train_static_feature_columns].dtypes != self._train_static_feature_dtypes
-        ]
-        if len(different_dtype_columns) > 0:
-            raise ValueError(
-                f"Columns {different_dtype_columns.to_list()} in tuning_data.static_features have dtypes that don't "
-                "match train_data.static_features. " + fix_message
-            )
-
-    def _preprocess_target_and_covariates(
-        self,
-        data: Optional[TimeSeriesDataFrame],
-        data_frame_name: str,
-        must_include_target: bool = True,
-        report_unused: bool = True,
-    ) -> Optional[TimeSeriesDataFrame]:
-        """Preprocess the columns of the TimeSeriesDataFrame and check if all expected columns are present.
-
-        This includes ensuring that:
-        - `self.target` is present among the columns (if `must_include_target=True`)
-        - all `self.known_covariates_names` are present among the columns
-        - `self.target` and `self.known_covariates_names` columns have np.float64 dtype
-        - no columns other than `self.target` and `self.known_covariates_names` are present in the dataframe
-        """
-        if data is None:
-            return data
-
-        data = data.copy(deep=False)
-
-        if must_include_target:
-            if self.target not in data.columns:
-                raise ValueError(f"Target column `{self.target}` not found in {data_frame_name}.")
-            try:
-                data[self.target] = data[self.target].astype(np.float64)
-            except ValueError:
-                raise ValueError(
-                    f"The target column {self.target} must have numeric (float or int) dtype, "
-                    f"but in {data_frame_name} it has dtype {data[self.target].dtype}"
-                )
-
-        if len(self.known_covariates_names) > 0:
-            missing_columns = list(set(self.known_covariates_names).difference(set(data.columns)))
-            if len(missing_columns) > 0:
-                raise ValueError(
-                    f"Columns {missing_columns} provided as known_covariates_names are missing from {data_frame_name}."
-                )
-            try:
-                data[self.known_covariates_names] = data[self.known_covariates_names].astype(np.float64)
-            except ValueError:
-                raise ValueError(
-                    f"Columns {self.known_covariates_names} must all have numeric (float or int) dtypes, "
-                    f"but in {data_frame_name} they have dtypes {data[self.known_covariates_names].dtypes}"
-                )
-
-        unused_columns = list(set(data.columns).difference(set([self.target] + self.known_covariates_names)))
-        if len(unused_columns) > 0:
-            if report_unused:
-                logger.warning(f"Provided columns {unused_columns} in {data_frame_name} will be ignored.")
-            data = data.drop(unused_columns, axis=1)
-        return data
+        self.save()
 
     def _align_covariates_with_forecast_index(
         self,
@@ -299,13 +152,18 @@ class TimeSeriesLearner(AbstractLearner):
                 f"known_covariates {self.known_covariates_names} for the forecast horizon should be provided at prediction time."
             )
 
+        if self.target in known_covariates.columns:
+            known_covariates = known_covariates.drop(self.target, axis=1)
+
         missing_item_ids = data.item_ids.difference(known_covariates.item_ids)
         if len(missing_item_ids) > 0:
             raise ValueError(
-                f"known_covariates are missing information for the following item_ids: {missing_item_ids.to_list()}."
+                f"known_covariates are missing information for the following item_ids: {reprlib.repr(missing_item_ids.to_list())}."
             )
 
-        forecast_index = get_forecast_horizon_index_ts_dataframe(data, prediction_length=self.prediction_length)
+        forecast_index = get_forecast_horizon_index_ts_dataframe(
+            data, prediction_length=self.prediction_length, freq=self.freq
+        )
         try:
             known_covariates = known_covariates.loc[forecast_index]
         except KeyError:
@@ -320,35 +178,123 @@ class TimeSeriesLearner(AbstractLearner):
         data: TimeSeriesDataFrame,
         known_covariates: Optional[TimeSeriesDataFrame] = None,
         model: Optional[Union[str, AbstractTimeSeriesModel]] = None,
+        use_cache: bool = True,
+        random_seed: Optional[int] = None,
         **kwargs,
     ) -> TimeSeriesDataFrame:
-        if self.static_feature_pipeline.is_fit():
-            fix_message = (
-                "Please make sure that data has static_features with columns and dtypes exactly matching "
-                "train_data.static_features. "
-            )
-            self._check_static_feature_compatibility(data.static_features, fix_message=fix_message, other_name="data")
-            data.static_features = self.static_feature_pipeline.transform(data.static_features)
-            data.static_features = convert_numerical_features_to_float(data.static_features)
-        data = self._preprocess_target_and_covariates(data, data_frame_name="data")
-        known_covariates = self._preprocess_target_and_covariates(
-            known_covariates, data_frame_name="known_covariates", must_include_target=False
-        )
+        data = self.feature_generator.transform(data)
+        known_covariates = self.feature_generator.transform_future_known_covariates(known_covariates)
         known_covariates = self._align_covariates_with_forecast_index(known_covariates=known_covariates, data=data)
-        prediction = self.load_trainer().predict(data=data, known_covariates=known_covariates, model=model, **kwargs)
-        if prediction is None:
-            raise RuntimeError("Prediction failed, please provide a different model to the `predict` method.")
-        return prediction
+        return self.load_trainer().predict(
+            data=data,
+            known_covariates=known_covariates,
+            model=model,
+            use_cache=use_cache,
+            random_seed=random_seed,
+            **kwargs,
+        )
 
     def score(
-        self, data: TimeSeriesDataFrame, model: AbstractTimeSeriesModel = None, metric: Optional[str] = None
+        self,
+        data: TimeSeriesDataFrame,
+        model: AbstractTimeSeriesModel = None,
+        metric: Union[str, TimeSeriesScorer, None] = None,
+        use_cache: bool = True,
     ) -> float:
-        data = self._preprocess_target_and_covariates(data, data_frame_name="data")
-        return self.load_trainer().score(data=data, model=model, metric=metric)
+        data = self.feature_generator.transform(data)
+        return self.load_trainer().score(data=data, model=model, metric=metric, use_cache=use_cache)
 
-    def leaderboard(self, data: Optional[TimeSeriesDataFrame] = None) -> pd.DataFrame:
-        data = self._preprocess_target_and_covariates(data, data_frame_name="data")
-        return self.load_trainer().leaderboard(data)
+    def evaluate(
+        self,
+        data: TimeSeriesDataFrame,
+        model: Optional[str] = None,
+        metrics: Optional[Union[str, TimeSeriesScorer, List[Union[str, TimeSeriesScorer]]]] = None,
+        use_cache: bool = True,
+    ) -> Dict[str, float]:
+        data = self.feature_generator.transform(data)
+        return self.load_trainer().evaluate(data=data, model=model, metrics=metrics, use_cache=use_cache)
+
+    def get_feature_importance(
+        self,
+        data: Optional[TimeSeriesDataFrame] = None,
+        model: Optional[str] = None,
+        metric: Optional[Union[str, TimeSeriesScorer]] = None,
+        features: Optional[List[str]] = None,
+        time_limit: Optional[float] = None,
+        method: Literal["naive", "permutation"] = "permutation",
+        subsample_size: int = 50,
+        num_iterations: int = 1,
+        random_seed: Optional[int] = None,
+        relative_scores: bool = False,
+        include_confidence_band: bool = True,
+        confidence_level: float = 0.99,
+    ) -> pd.DataFrame:
+        trainer = self.load_trainer()
+        if data is None:
+            data = trainer.load_val_data() or trainer.load_train_data()
+
+        # if features are provided in the dataframe, check that they are valid features in the covariate metadata
+        provided_static_columns = [] if data.static_features is None else data.static_features.columns
+        unused_features = [
+            f
+            for f in set(provided_static_columns).union(set(data.columns) - {self.target})
+            if f not in self.feature_generator.covariate_metadata.all_features
+        ]
+
+        if features is None:
+            features = self.feature_generator.covariate_metadata.all_features
+        else:
+            if len(features) == 0:
+                raise ValueError(
+                    "No features provided to compute feature importance. At least some valid features should be provided."
+                )
+            for fn in features:
+                if fn not in self.feature_generator.covariate_metadata.all_features and fn not in unused_features:
+                    raise ValueError(f"Feature {fn} not found in covariate metadata or the dataset.")
+
+        if len(set(features)) < len(features):
+            raise ValueError(
+                "Duplicate feature names provided to compute feature importance. "
+                "Please provide unique feature names across both static features and covariates."
+            )
+
+        data = self.feature_generator.transform(data)
+
+        importance_df = trainer.get_feature_importance(
+            data=data,
+            features=features,
+            model=model,
+            metric=metric,
+            time_limit=time_limit,
+            method=method,
+            subsample_size=subsample_size,
+            num_iterations=num_iterations,
+            random_seed=random_seed,
+            relative_scores=relative_scores,
+            include_confidence_band=include_confidence_band,
+            confidence_level=confidence_level,
+        )
+
+        for feature in set(features).union(unused_features):
+            if feature not in importance_df.index:
+                importance_df.loc[feature] = (
+                    [0, 0, 0] if not include_confidence_band else [0, 0, 0, float("nan"), float("nan")]
+                )
+
+        return importance_df
+
+    def leaderboard(
+        self,
+        data: Optional[TimeSeriesDataFrame] = None,
+        extra_info: bool = False,
+        extra_metrics: Optional[List[Union[str, TimeSeriesScorer]]] = None,
+        use_cache: bool = True,
+    ) -> pd.DataFrame:
+        if data is not None:
+            data = self.feature_generator.transform(data)
+        return self.load_trainer().leaderboard(
+            data, extra_info=extra_info, extra_metrics=extra_metrics, use_cache=use_cache
+        )
 
     def get_info(self, include_model_info: bool = False, **kwargs) -> Dict[str, Any]:
         learner_info = super().get_info(include_model_info=include_model_info)
@@ -362,9 +308,37 @@ class TimeSeriesLearner(AbstractLearner):
         )
 
         learner_info.update(trainer_info)
+        # self.random_state not used during fitting, so we don't include it in the summary
+        # TODO: Report random seed passed to predictor.fit?
+        learner_info.pop("random_state", None)
         return learner_info
 
-    def refit_full(self, models="all"):
-        # TODO: Implement refitting
-        # return self.load_trainer().refit_full(models=models)
-        raise NotImplementedError("refitting logic currently not implemented in autogluon.timeseries")
+    def persist_trainer(
+        self, models: Union[Literal["all", "best"], List[str]] = "all", with_ancestors: bool = False
+    ) -> List[str]:
+        """Loads models and trainer in memory so that they don't have to be
+        loaded during predictions
+
+        Returns
+        -------
+        list_of_models : List[str]
+            List of models persisted in memory
+        """
+        self.trainer = self.load_trainer()
+        return self.trainer.persist(models, with_ancestors=with_ancestors)
+
+    def unpersist_trainer(self) -> List[str]:
+        """Unloads models and trainer from memory. Models will have to be reloaded from disk
+        when predicting.
+
+        Returns
+        -------
+        list_of_models : List[str]
+            List of models removed from memory
+        """
+        unpersisted_models = self.load_trainer().unpersist()
+        self.trainer = None
+        return unpersisted_models
+
+    def refit_full(self, model: str = "all") -> Dict[str, str]:
+        return self.load_trainer().refit_full(model=model)

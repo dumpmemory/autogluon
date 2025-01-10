@@ -3,6 +3,7 @@ import datetime
 import tempfile
 import traceback
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Iterable
 
 import numpy as np
@@ -17,14 +18,16 @@ from autogluon.timeseries.dataset.ts_dataframe import (
     TimeSeriesDataFrame,
 )
 
-START_TIMESTAMP = pd.Timestamp("01-01-2019", freq="D")  # type: ignore
-END_TIMESTAMP = pd.Timestamp("01-02-2019", freq="D")  # type: ignore
-ITEM_IDS = (0, 1, 2)
-TARGETS = np.arange(9)
-DATETIME_INDEX = tuple(pd.date_range(START_TIMESTAMP, periods=3))
-EMPTY_ITEM_IDS = np.array([], dtype=np.int64)
+from .common import get_data_frame_with_variable_lengths, to_supported_pandas_freq
+
+START_TIMESTAMP = pd.Timestamp("01-01-2019")  # type: ignore
+END_TIMESTAMP = pd.Timestamp("01-02-2019")  # type: ignore
+ITEM_IDS = np.array([0, 1, 2], dtype=int)
+TARGETS = np.arange(9, dtype=np.float64)
+DATETIME_INDEX = tuple(pd.date_range(START_TIMESTAMP, periods=3, freq="D"))
+EMPTY_ITEM_IDS = np.array([], dtype=int)
 EMPTY_DATETIME_INDEX = np.array([], dtype=np.dtype("datetime64[ns]"))  # type: ignore
-EMPTY_TARGETS = np.array([], dtype=np.int64)
+EMPTY_TARGETS = np.array([], dtype=np.float64)
 
 
 def _build_ts_dataframe(item_ids, datetime_index, target, static_features=None):
@@ -50,27 +53,24 @@ SAMPLE_TS_DATAFRAME_STATIC = _build_ts_dataframe(
     ),
 )
 SAMPLE_DATAFRAME = pd.DataFrame(SAMPLE_TS_DATAFRAME).reset_index()
+SAMPLE_STATIC_DATAFRAME = SAMPLE_TS_DATAFRAME_STATIC.static_features.reset_index()
 
 
 SAMPLE_ITERABLE = [
-    {"target": [0, 1, 2], "start": pd.Timestamp("01-01-2019", freq="D")},  # type: ignore
-    {"target": [3, 4, 5], "start": pd.Timestamp("01-01-2019", freq="D")},  # type: ignore
-    {"target": [6, 7, 8], "start": pd.Timestamp("01-01-2019", freq="D")},  # type: ignore
+    {"target": [0.0, 1.0, 2.0], "start": pd.Period("01-01-2019", freq="D")},  # type: ignore
+    {"target": [3.0, 4.0, 5.0], "start": pd.Period("01-01-2019", freq="D")},  # type: ignore
+    {"target": [6.0, 7.0, 8.0], "start": pd.Period("01-01-2019", freq="D")},  # type: ignore
 ]
 
 
 def test_from_iterable():
     ts_df = TimeSeriesDataFrame(SAMPLE_ITERABLE)
-    pd.testing.assert_frame_equal(ts_df, SAMPLE_TS_DATAFRAME, check_dtype=True)
+    pd.testing.assert_frame_equal(ts_df, SAMPLE_TS_DATAFRAME, check_dtype=True, check_index_type=False)
 
     with pytest.raises(ValueError):
         TimeSeriesDataFrame([])
 
     sample_iter = [{"target": [0, 1, 2]}]
-    with pytest.raises(ValueError):
-        TimeSeriesDataFrame(sample_iter)
-
-    sample_iter = [{"target": [0, 1, 2], "start": pd.Timestamp("01-01-2019")}]  # type: ignore
     with pytest.raises(ValueError):
         TimeSeriesDataFrame(sample_iter)
 
@@ -108,7 +108,7 @@ def test_from_gluonts_list_dataset():
     prediction_length = 24
     freq = "D"
     custom_dataset = np.random.normal(size=(number_of_ts, ts_length))
-    start = pd.Timestamp("01-01-2019", freq=freq)  # type: ignore
+    start = pd.Period("01-01-2019", freq=freq)  # type: ignore
 
     gluonts_list_dataset = ListDataset(
         [{"target": x, "start": start} for x in custom_dataset[:, :-prediction_length]],
@@ -117,7 +117,7 @@ def test_from_gluonts_list_dataset():
     TimeSeriesDataFrame(gluonts_list_dataset)
 
     ts_df = TimeSeriesDataFrame(ListDataset(SAMPLE_ITERABLE, freq=freq))
-    pd.testing.assert_frame_equal(ts_df, SAMPLE_TS_DATAFRAME, check_dtype=False)
+    pd.testing.assert_frame_equal(ts_df, SAMPLE_TS_DATAFRAME, check_dtype=False, check_index_type=False)
 
     empty_list_dataset = ListDataset([], freq=freq)
     with pytest.raises(ValueError):
@@ -136,10 +136,10 @@ def test_from_data_frame():
             pd.Timestamp("01-03-2019"),  # type: ignore
             ITEM_IDS,
             tuple(pd.date_range(START_TIMESTAMP, periods=2)),
-            [0, 1, 3, 4, 6, 7],
+            [0.0, 1.0, 3.0, 4.0, 6.0, 7.0],
             ITEM_IDS,
             tuple(pd.date_range(pd.Timestamp("01-03-2019"), periods=1)),  # type: ignore
-            [2, 5, 8],
+            [2.0, 5.0, 8.0],
         ),
         (
             pd.Timestamp("01-01-2019"),  # type: ignore
@@ -185,14 +185,14 @@ def test_split_by_time(
             END_TIMESTAMP,
             ITEM_IDS,
             tuple(pd.date_range(START_TIMESTAMP, periods=1)),
-            [0, 3, 6],
+            [0.0, 3.0, 6.0],
         ),
         (
             pd.Timestamp("12-31-2018"),  # type: ignore
             END_TIMESTAMP,
             ITEM_IDS,
             tuple(pd.date_range(START_TIMESTAMP, periods=1)),
-            [0, 3, 6],
+            [0.0, 3.0, 6.0],
         ),
         (
             START_TIMESTAMP,
@@ -221,8 +221,8 @@ def test_slice_by_time(start_timestamp, end_timestamp, item_ids, datetimes, targ
     [
         (["2020-01-01 00:00:00", "2020-01-02 00:00:00", "2020-01-03 00:00:00"], "D"),
         (["2020-01-01 00:00:00", "2020-01-03 00:00:00", "2020-01-05 00:00:00"], "2D"),
-        (["2020-01-01 00:00:00", "2020-01-01 00:01:00", "2020-01-01 00:02:00"], "T"),
-        (["2020-01-01 00:00:00", "2020-01-01 01:00:00", "2020-01-01 02:00:00"], "H"),
+        (["2020-01-01 00:00:00", "2020-01-01 00:01:00", "2020-01-01 00:02:00"], "min"),
+        (["2020-01-01 00:00:00", "2020-01-01 01:00:00", "2020-01-01 02:00:00"], "h"),
     ],
 )
 def test_when_dataset_constructed_from_dataframe_without_freq_then_freq_is_inferred(timestamps, expected_freq):
@@ -235,22 +235,23 @@ def test_when_dataset_constructed_from_dataframe_without_freq_then_freq_is_infer
     )
 
     ts_df = TimeSeriesDataFrame.from_data_frame(df)
-    assert ts_df.freq == expected_freq
+    assert ts_df.freq == to_supported_pandas_freq(expected_freq)
 
 
 FREQ_TEST_CASES = [
     ("2020-01-01 00:00:00", "D"),
     ("2020-01-01", "D"),
     ("2020-01-01 00:00:00", "2D"),
-    ("2020-01-01 00:00:00", "T"),
-    ("2020-01-01 00:00:00", "H"),
-    ("2020-01-31 00:00:00", "M"),
-    ("2020-01-31", "M"),
+    ("2020-01-01 00:00:00", "min"),
+    ("2020-01-01 00:00:00", "h"),
+    ("2020-01-31 00:00:00", "ME"),
+    ("2020-01-31", "ME"),
 ]
 
 
 @pytest.mark.parametrize("start_time, freq", FREQ_TEST_CASES)
 def test_when_dataset_constructed_from_iterable_with_freq_then_freq_is_inferred(start_time, freq):
+    freq = to_supported_pandas_freq(freq)
     item_list = ListDataset(
         [{"target": [1, 2, 3], "start": pd.Timestamp(start_time)} for _ in range(3)],  # type: ignore
         freq=freq,
@@ -263,8 +264,11 @@ def test_when_dataset_constructed_from_iterable_with_freq_then_freq_is_inferred(
 
 @pytest.mark.parametrize("start_time, freq", FREQ_TEST_CASES)
 def test_when_dataset_constructed_via_constructor_with_freq_then_freq_is_inferred(start_time, freq):
+    freq = to_supported_pandas_freq(freq)
+    # Period requires freq=M for ME frequency
+    start_period = pd.Period(start_time, freq={"ME": "M"}.get(freq))
     item_list = ListDataset(
-        [{"target": [1, 2, 3], "start": pd.Timestamp(start_time, freq=freq)} for _ in range(3)],  # type: ignore
+        [{"target": [1, 2, 3], "start": start_period} for _ in range(3)],  # type: ignore
         freq=freq,
     )
 
@@ -277,8 +281,10 @@ def test_when_dataset_constructed_via_constructor_with_freq_then_freq_is_inferre
 def test_when_dataset_constructed_via_constructor_with_freq_and_persisted_then_cached_freq_is_persisted(
     start_time, freq
 ):
+    freq = to_supported_pandas_freq(freq)
+    start_period = pd.Period(start_time, freq={"ME": "M"}.get(freq))
     item_list = ListDataset(
-        [{"target": [1, 2, 3], "start": pd.Timestamp(start_time, freq=freq)} for _ in range(3)],  # type: ignore
+        [{"target": [1, 2, 3], "start": start_period} for _ in range(3)],  # type: ignore
         freq=freq,
     )
 
@@ -297,6 +303,9 @@ def test_when_dataset_constructed_via_constructor_with_freq_and_persisted_then_c
 
 IRREGULAR_TIME_INDEXES = [
     [
+        ["2020-01-01 00:00:00", "2020-01-01 00:01:00"],
+    ],
+    [
         ["2020-01-01 00:00:00", "2020-01-02 00:00:00", "2020-01-03 00:01:00"],
     ],
     [
@@ -306,6 +315,10 @@ IRREGULAR_TIME_INDEXES = [
     [
         ["2020-01-01 00:00:00", "2020-01-02 00:00:00", "2020-01-03 00:00:00"],
         ["2020-01-01 00:00:00", "2020-01-02 00:00:00", "2020-01-04 00:00:00"],
+    ],
+    [
+        ["2020-01-01 00:00:00", "2020-01-02 00:00:00", "2020-01-03 00:00:00"],
+        ["2020-01-01 00:00:00", "2020-02-01 00:00:00", "2020-03-01 00:00:00"],
     ],
     [
         ["2020-01-01 00:00:00", "2020-01-02 00:00:00", "2020-01-03 00:01:00"],
@@ -346,10 +359,24 @@ def test_when_dataset_constructed_with_irregular_timestamps_then_freq_call_cache
     assert tsdf._cached_freq == IRREGULAR_TIME_INDEX_FREQSTR
 
 
+@pytest.mark.parametrize("irregular_index", IRREGULAR_TIME_INDEXES)
+def test_given_raise_if_irregular_is_true_when_frequency_inferred_then_error_is_raised(irregular_index):
+    df_tuples = []
+    for i, ts in enumerate(irregular_index):
+        for t in ts:
+            df_tuples.append((i, pd.Timestamp(t), np.random.rand()))
+
+    df = pd.DataFrame(df_tuples, columns=[ITEMID, TIMESTAMP, "target"])
+
+    tsdf = TimeSeriesDataFrame.from_data_frame(df)
+    with pytest.raises(ValueError, match="Cannot infer frequency"):
+        tsdf.infer_frequency(raise_if_irregular=True)
+
+
 SAMPLE_ITERABLE_2 = [
-    {"target": [0, 1, 2, 3], "start": pd.Timestamp("2019-01-01", freq="D")},  # type: ignore
-    {"target": [3, 4, 5, 4], "start": pd.Timestamp("2019-01-02", freq="D")},  # type: ignore
-    {"target": [6, 7, 8, 5], "start": pd.Timestamp("2019-01-03", freq="D")},  # type: ignore
+    {"target": [0, 1, 2, 3], "start": pd.Period("2019-01-01", freq="D")},  # type: ignore
+    {"target": [3, 4, 5, 4], "start": pd.Period("2019-01-02", freq="D")},  # type: ignore
+    {"target": [6, 7, 8, 5], "start": pd.Period("2019-01-03", freq="D")},  # type: ignore
 ]
 
 
@@ -467,7 +494,7 @@ def test_when_dataframe_copy_called_on_instance_then_output_correct(input_df):
     copied_df = input_df.copy()
 
     assert isinstance(copied_df, TimeSeriesDataFrame)
-    assert copied_df._data is not input_df._data
+    assert copied_df._mgr is not input_df._mgr
 
 
 @pytest.mark.parametrize("input_df", [SAMPLE_TS_DATAFRAME, SAMPLE_TS_DATAFRAME_EMPTY])
@@ -475,7 +502,7 @@ def test_when_dataframe_stdlib_copy_called_then_output_correct(input_df):
     copied_df = copy.deepcopy(input_df)
 
     assert isinstance(copied_df, TimeSeriesDataFrame)
-    assert copied_df._data is not input_df._data
+    assert copied_df._mgr is not input_df._mgr
 
 
 @pytest.mark.parametrize("input_df", [SAMPLE_TS_DATAFRAME, SAMPLE_TS_DATAFRAME_EMPTY])
@@ -483,7 +510,7 @@ def test_when_dataframe_class_copy_called_then_output_correct(input_df):
     copied_df = TimeSeriesDataFrame.copy(input_df, deep=True)
 
     assert isinstance(copied_df, TimeSeriesDataFrame)
-    assert copied_df._data is not input_df._data
+    assert copied_df._mgr is not input_df._mgr
 
 
 @pytest.mark.parametrize("input_df", [SAMPLE_TS_DATAFRAME, SAMPLE_TS_DATAFRAME_EMPTY])
@@ -497,7 +524,7 @@ def test_when_dataframe_class_rename_called_then_output_correct(input_df, inplac
     assert "mytarget" in renamed_df.columns
     assert "target" not in renamed_df.columns
     if inplace:
-        assert renamed_df._data is input_df._data
+        assert renamed_df._mgr is input_df._mgr
 
 
 @pytest.mark.parametrize("input_df", [SAMPLE_TS_DATAFRAME, SAMPLE_TS_DATAFRAME_EMPTY])
@@ -511,13 +538,12 @@ def test_when_dataframe_instance_rename_called_then_output_correct(input_df, inp
     assert "mytarget" in renamed_df.columns
     assert "target" not in renamed_df.columns
     if inplace:
-        assert renamed_df._data is input_df._data
+        assert renamed_df._mgr is input_df._mgr
 
 
 @pytest.mark.parametrize("input_df", [SAMPLE_TS_DATAFRAME, SAMPLE_TS_DATAFRAME_EMPTY])
 @pytest.mark.parametrize("read_fn", [pd.read_pickle, TimeSeriesDataFrame.from_pickle])
 def test_when_dataframe_read_pickle_called_then_output_correct(input_df, read_fn):
-
     with tempfile.TemporaryDirectory() as td:
         pkl_filename = Path(td) / "temp_pickle.pkl"
         input_df.to_pickle(str(pkl_filename))
@@ -557,7 +583,7 @@ def test_when_dataframe_stdlib_copy_called_then_static_features_are_correct():
     copied_df = copy.deepcopy(input_df)
 
     assert input_df.static_features.equals(copied_df.static_features)
-    assert copied_df._data is not input_df._data
+    assert copied_df._mgr is not input_df._mgr
 
 
 @pytest.mark.parametrize("inplace", [True, False])
@@ -571,7 +597,7 @@ def test_when_dataframe_class_rename_called_then_static_features_are_correct(inp
     assert "mytarget" in renamed_df.columns
     assert "target" not in renamed_df.columns
     if inplace:
-        assert renamed_df._data is input_df._data
+        assert renamed_df._mgr is input_df._mgr
     assert renamed_df.static_features.equals(input_df.static_features)
 
 
@@ -588,7 +614,7 @@ def test_when_dataframe_instance_rename_called_then_static_features_are_correct(
     assert "mytarget" in renamed_df.columns
     assert "target" not in renamed_df.columns
     if inplace:
-        assert renamed_df._data is input_df._data
+        assert renamed_df._mgr is input_df._mgr
     assert renamed_df.static_features.equals(input_df.static_features)
 
 
@@ -602,9 +628,18 @@ def test_when_dataset_sliced_by_step_then_static_features_are_correct():
     assert dfv.static_features.equals(df.static_features)
 
 
-def test_when_dataset_subsequenced_then_static_features_are_correct():
+def test_when_static_features_index_has_wrong_name_then_its_renamed_to_item_id():
+    original_df = SAMPLE_TS_DATAFRAME.copy()
+    item_ids = original_df.item_ids
+    static_features = pd.DataFrame({"feat1": np.zeros_like(item_ids)}, index=item_ids.rename("wrong_index_name"))
+    original_df.static_features = static_features
+    assert static_features.index.name != ITEMID
+    assert original_df.static_features.index.name == ITEMID
+
+
+def test_when_dataset_sliced_by_time_then_static_features_are_correct():
     df = SAMPLE_TS_DATAFRAME_STATIC
-    dfv = df.subsequence(START_TIMESTAMP, START_TIMESTAMP + datetime.timedelta(days=1))
+    dfv = df.slice_by_time(START_TIMESTAMP, START_TIMESTAMP + datetime.timedelta(days=1))
 
     assert isinstance(dfv, TimeSeriesDataFrame)
     assert len(dfv) == 1 * len(dfv.item_ids)
@@ -659,7 +694,7 @@ def test_given_wrong_static_feature_index_when_constructing_data_frame_then_erro
         },
         index=static_feature_index,  # noqa
     )
-    with pytest.raises(ValueError, match="match item index"):
+    with pytest.raises(ValueError, match="are missing from the index of static_features"):
         TimeSeriesDataFrame(data=SAMPLE_DATAFRAME, static_features=static_features)
 
 
@@ -679,9 +714,40 @@ def test_when_dataframe_sliced_by_item_array_then_static_features_stay_consisten
     assert set(right.static_features.index) == set(right_index)
 
 
-def test_when_dataframe_reindexed_view_called_then_static_features_stay_consistent():
-    view = SAMPLE_TS_DATAFRAME_STATIC.get_reindexed_view()
-    assert view._static_features is SAMPLE_TS_DATAFRAME_STATIC._static_features
+def test_given_wrong_ids_stored_in_item_id_column_when_constructing_tsdf_then_exception_is_raised():
+    df = SAMPLE_DATAFRAME.copy()
+    static_df = SAMPLE_STATIC_DATAFRAME.copy()
+    static_df.index = ["B", "C", "A"]
+    static_df["item_id"] = ["B", "C", "A"]
+    with pytest.raises(ValueError, match="ids are missing from the index"):
+        TimeSeriesDataFrame(df, static_features=static_df)
+
+
+def test_given_static_features_have_multiindex_when_constructing_tsdf_then_exception_is_raised():
+    df = SAMPLE_DATAFRAME.copy()
+    static_df = SAMPLE_STATIC_DATAFRAME.copy()
+    static_df.index = pd.MultiIndex.from_arrays([ITEM_IDS, ["B", "C", "A"]], names=["item_id", "extra_level"])
+    with pytest.raises(ValueError, match="cannot have a MultiIndex"):
+        TimeSeriesDataFrame(df, static_features=static_df)
+
+
+def test_given_item_id_is_stored_as_column_and_not_index_in_static_features_then_tsdf_is_constructed_correctly():
+    df = SAMPLE_DATAFRAME.copy()
+    static_df = SAMPLE_STATIC_DATAFRAME.copy()
+    static_df.index = ["B", "C", "A"]
+    static_df["item_id"] = ITEM_IDS
+    ts_df = TimeSeriesDataFrame(df, static_features=static_df)
+    assert ts_df.static_features.equals(SAMPLE_TS_DATAFRAME_STATIC.static_features)
+
+
+def test_given_item_id_stored_in_both_index_and_column_when_constructing_tsdf_then_values_in_index_are_used():
+    df = SAMPLE_DATAFRAME.copy()
+    static_df = SAMPLE_STATIC_DATAFRAME.copy()
+    static_df = static_df.set_index(ITEMID)
+    static_df[ITEMID] = ["B", "C", "A"]  # these shouldn't be used; static_df.index should be used instead
+    ts_df = TimeSeriesDataFrame(df)
+    ts_df.static_features = static_df
+    assert (ts_df.static_features[ITEMID] == ["B", "C", "A"]).all()
 
 
 SAMPLE_DATAFRAME_WITH_MIXED_INDEX = pd.DataFrame(
@@ -701,7 +767,7 @@ SAMPLE_DATAFRAME_WITH_MIXED_INDEX = pd.DataFrame(
         SAMPLE_DATAFRAME_WITH_MIXED_INDEX.set_index([ITEMID, TIMESTAMP]),
     ],
 )
-def test_when_item_id_index_has_mixed_dtype_then_value_error_is_raied(input_df):
+def test_when_item_id_index_has_mixed_dtype_then_value_error_is_raised(input_df):
     with pytest.raises(ValueError, match="must be of integer or string dtype"):
         TimeSeriesDataFrame(input_df)
 
@@ -711,3 +777,265 @@ def test_when_static_features_are_modified_on_shallow_copy_then_original_df_does
     new_df = old_df.copy(deep=False)
     new_df.static_features = None
     assert old_df.static_features is not None
+
+
+@pytest.mark.parametrize("timestamp_column", ["timestamp", None, "custom_ts_column"])
+def test_when_dataset_constructed_from_dataframe_then_timestamp_column_is_converted_to_datetime(timestamp_column):
+    timestamps = ["2020-01-01", "2020-01-02", "2020-01-03"]
+    df = pd.DataFrame(
+        {
+            "item_id": np.ones(len(timestamps), dtype=np.int64),
+            timestamp_column or "timestamp": timestamps,
+            "target": np.ones(len(timestamps)),
+        }
+    )
+    ts_df = TimeSeriesDataFrame.from_data_frame(df, timestamp_column=timestamp_column)
+    assert ts_df.index.get_level_values(level=TIMESTAMP).dtype == "datetime64[ns]"
+
+
+def test_when_path_is_given_to_constructor_then_tsdf_is_constructed_correctly():
+    df = SAMPLE_TS_DATAFRAME.reset_index()
+    with TemporaryDirectory() as temp_dir:
+        temp_file = str(Path(temp_dir) / "temp.csv")
+        df.to_csv(temp_file)
+
+        ts_df = TimeSeriesDataFrame(temp_file)
+        assert isinstance(ts_df.index, pd.MultiIndex)
+        assert ts_df.index.names == [ITEMID, TIMESTAMP]
+        assert len(ts_df) == len(SAMPLE_TS_DATAFRAME)
+
+
+def test_given_custom_id_column_when_data_and_static_are_loaded_from_path_them_tsdf_is_constructed_correctly():
+    df = pd.DataFrame(SAMPLE_TS_DATAFRAME_STATIC).reset_index()
+    static_df = SAMPLE_TS_DATAFRAME_STATIC.static_features.reset_index()
+
+    df = df.rename(columns={ITEMID: "custom_item_id"})
+    static_df = static_df.rename(columns={ITEMID: "custom_item_id"})
+
+    with TemporaryDirectory() as temp_dir:
+        temp_file = Path(temp_dir) / "data.csv"
+        df.to_csv(temp_file, index=False)
+
+        temp_static_file = Path(temp_dir) / "static.csv"
+        static_df.to_csv(temp_static_file, index=False)
+
+        ts_df = TimeSeriesDataFrame.from_path(
+            temp_file, id_column="custom_item_id", static_features_path=temp_static_file
+        )
+    assert isinstance(ts_df, TimeSeriesDataFrame)
+    assert isinstance(ts_df.index, pd.MultiIndex)
+    assert ts_df.index.names == [ITEMID, TIMESTAMP]
+    assert len(ts_df) == len(SAMPLE_TS_DATAFRAME_STATIC)
+
+    assert ts_df.static_features.index.equals(SAMPLE_TS_DATAFRAME_STATIC.static_features.index)
+    assert ts_df.static_features.columns.equals(SAMPLE_TS_DATAFRAME_STATIC.static_features.columns)
+
+
+def test_given_static_features_are_missing_when_loading_from_path_then_tsdf_can_be_constructed():
+    df = SAMPLE_DATAFRAME.copy()
+    with TemporaryDirectory() as temp_dir:
+        temp_file = Path(temp_dir) / "data.csv"
+        df.to_csv(temp_file, index=False)
+
+        ts_df = TimeSeriesDataFrame.from_path(temp_file, id_column=ITEMID, static_features_path=None)
+    assert isinstance(ts_df, TimeSeriesDataFrame)
+    assert ts_df.static_features is None
+
+
+FILL_METHODS = ["auto", "ffill", "pad", "backfill", "bfill", "interpolate", "constant"]
+
+
+@pytest.mark.parametrize("method", FILL_METHODS)
+def test_when_fill_missing_values_called_then_gaps_are_filled_and_index_is_unchanged(method):
+    df = get_data_frame_with_variable_lengths({"B": 15, "A": 20})
+    df.iloc[[1, 5, 10, 22]] = np.nan
+    df_filled = df.fill_missing_values(method=method)
+    assert not df_filled.isna().any().any()
+    assert df_filled.index.equals(df.index)
+
+
+@pytest.mark.parametrize("method", FILL_METHODS)
+def test_when_fill_missing_values_called_then_leading_nans_are_filled_and_index_is_unchanged(method):
+    if method in ["ffill", "pad", "interpolate"]:
+        pytest.skip(f"{method} doesn't fill leading NaNs")
+    df = get_data_frame_with_variable_lengths({"B": 15, "A": 20})
+    df.iloc[[0, 1, 2, 15, 16]] = np.nan
+    df_filled = df.fill_missing_values(method=method)
+    assert not df_filled.isna().any().any()
+    assert df_filled.index.equals(df.index)
+
+
+@pytest.mark.parametrize("method", FILL_METHODS)
+def test_when_fill_missing_values_called_then_trailing_nans_are_filled_and_index_is_unchanged(method):
+    if method in ["bfill", "backfill"]:
+        pytest.skip(f"{method} doesn't fill trailing NaNs")
+    df = get_data_frame_with_variable_lengths({"B": 15, "A": 20})
+    df.iloc[[13, 14, 34]] = np.nan
+    df_filled = df.fill_missing_values(method=method)
+    assert not df_filled.isna().any().any()
+    assert df_filled.index.equals(df.index)
+
+
+def test_when_dropna_called_then_missing_values_are_dropped():
+    df = get_data_frame_with_variable_lengths({"B": 15, "A": 20})
+    df.iloc[[1, 5, 10, 14, 22]] = np.nan
+    df_dropped = df.dropna()
+    assert not df_dropped.isna().any().any()
+
+
+def test_given_static_features_dont_contain_custom_id_column_when_from_data_frame_called_then_exception_is_raised():
+    df = SAMPLE_DATAFRAME.copy()
+    df = df.rename(columns={ITEMID: "custom_id"})
+    static_df = SAMPLE_STATIC_DATAFRAME.copy()
+    with pytest.raises(AssertionError, match="id' not found in static"):
+        TimeSeriesDataFrame.from_data_frame(df, id_column="custom_id", static_features_df=static_df)
+
+
+def test_when_data_contains_item_id_column_that_is_unused_then_column_is_renamed():
+    df = SAMPLE_DATAFRAME.copy()
+    df["custom_id"] = df[ITEMID]
+    ts_df = TimeSeriesDataFrame.from_data_frame(df, id_column="custom_id")
+    assert f"__{ITEMID}" in ts_df.columns
+
+
+def test_when_static_features_contain_item_id_column_that_is_unused_then_column_is_renamed():
+    df = SAMPLE_DATAFRAME.copy()
+    df["custom_id"] = df[ITEMID]
+
+    static_df = SAMPLE_STATIC_DATAFRAME.copy()
+    static_df["custom_id"] = static_df[ITEMID]
+
+    ts_df = TimeSeriesDataFrame.from_data_frame(df, id_column="custom_id", static_features_df=static_df)
+    assert f"__{ITEMID}" in ts_df.static_features.columns
+
+
+def test_when_data_contains_timestamp_column_that_is_unused_then_column_is_renamed():
+    df = SAMPLE_DATAFRAME.copy()
+    df["custom_timestamp"] = df[TIMESTAMP]
+    ts_df = TimeSeriesDataFrame.from_data_frame(df, timestamp_column="custom_timestamp")
+    assert f"__{TIMESTAMP}" in ts_df.columns
+
+
+@pytest.mark.parametrize("freq", ["D", "W", "ME", "QE", "YE", "h", "min", "s", "30min", "2h", "17s"])
+def test_given_index_is_irregular_when_convert_frequency_called_then_result_has_regular_index(freq):
+    freq = to_supported_pandas_freq(freq)
+    df_original = get_data_frame_with_variable_lengths({"B": 15, "A": 20}, freq=freq, covariates_names=["Y", "X"])
+
+    # Select random rows & reset cached freq
+    df_irregular = df_original.iloc[[2, 5, 7, 10, 14, 15, 16, 33]]
+    df_irregular._cached_freq = None
+    df_regular = df_irregular.convert_frequency(freq=freq)
+    for idx, value in df_regular.iterrows():
+        if idx in df_irregular.index:
+            assert (value == df_original.loc[idx]).all()
+        else:
+            assert value.isna().all()
+
+
+@pytest.mark.parametrize("freq", ["D", "W", "ME", "QE", "YE", "h", "min", "s", "30min", "2h", "17s"])
+def test_given_index_is_irregular_when_convert_frequency_called_then_new_index_has_desired_frequency(freq):
+    freq = to_supported_pandas_freq(freq)
+    df_original = get_data_frame_with_variable_lengths({"B": 15, "A": 20}, freq=freq, covariates_names=["Y", "X"])
+
+    df_irregular = df_original.iloc[[2, 5, 7, 10, 14, 15, 16, 33]]
+    df_irregular._cached_freq = None
+    assert df_irregular.freq is None
+    df_regular = df_irregular.convert_frequency(freq=freq)
+    assert df_regular.freq == pd.tseries.frequencies.to_offset(freq).freqstr
+
+
+def test_given_index_is_regular_when_convert_frequency_called_then_original_df_is_returned():
+    df = SAMPLE_TS_DATAFRAME.copy()
+    df_resampled = df.convert_frequency(freq=df.freq)
+    assert df is df_resampled
+
+
+def test_when_convert_frequency_called_with_different_freq_then_original_df_is_not_modified():
+    df = SAMPLE_TS_DATAFRAME.copy()
+    original_freq = df.freq
+    df_resampled = df.convert_frequency(freq="h")
+    assert df_resampled.freq != original_freq
+    assert df.equals(SAMPLE_TS_DATAFRAME)
+    assert df.freq == original_freq
+
+
+def test_when_convert_frequency_called_then_static_features_are_kept():
+    df = SAMPLE_TS_DATAFRAME_STATIC.copy()
+    df_resampled = df.convert_frequency("W")
+    assert df_resampled.static_features is not None
+    assert df_resampled.static_features.equals(df.static_features)
+
+
+@pytest.mark.parametrize("freq", ["D", "ME", "6h"])
+def test_given_index_is_regular_when_convert_frequency_is_called_then_new_index_has_desired_frequency(freq):
+    freq = to_supported_pandas_freq(freq)
+    start = "2020-05-01"
+    end = "2020-07-31"
+    timestamps_original = pd.date_range(start=start, end=end, freq="D")
+    timestamps_resampled = pd.date_range(start=start, end=end, freq=freq)
+    df = pd.DataFrame(
+        {
+            ITEMID: [0] * len(timestamps_original),
+            TIMESTAMP: timestamps_original,
+            "target": np.random.rand(len(timestamps_original)),
+        }
+    )
+    ts_df = TimeSeriesDataFrame(df)
+    ts_df_resampled = ts_df.convert_frequency(freq=freq)
+    assert (ts_df_resampled.index.get_level_values(TIMESTAMP) == timestamps_resampled).all()
+    assert pd.tseries.frequencies.to_offset(ts_df_resampled.freq) == pd.tseries.frequencies.to_offset(freq)
+
+
+@pytest.mark.parametrize(
+    "agg_method, values_after_aggregation",
+    [
+        ("mean", [1.5, 3.0, 4.5, 6.0]),
+        ("min", [1.0, 3.0, 4.0, 6.0]),
+        ("max", [2.0, 3.0, 5.0, 6.0]),
+        ("first", [1.0, 3.0, 4.0, 6.0]),
+        ("last", [2.0, 3.0, 5.0, 6.0]),
+        ("sum", [3.0, 3.0, 9.0, 6.0]),
+    ],
+)
+def test_when_aggregation_method_is_changed_then_aggregated_result_is_correct(agg_method, values_after_aggregation):
+    ts_df = TimeSeriesDataFrame(
+        pd.DataFrame(
+            {
+                ITEMID: ["A", "A", "A", "A", "A", "B"],
+                TIMESTAMP: ["2022-01-01", "2022-01-02", "2022-01-05", "2022-01-10", "2022-01-11", "2020-01-01"],
+                "target": np.arange(1, 7),
+            }
+        )
+    )
+    aggregated = ts_df.convert_frequency(freq="W", agg_numeric=agg_method)
+    assert np.all(aggregated.values.ravel() == np.array(values_after_aggregation))
+
+
+@pytest.mark.parametrize("freq", ["D", "W", "ME", "QE", "YE", "h", "min", "s", "30min", "2h", "17s"])
+def test_when_convert_frequency_called_then_categorical_columns_are_preserved(freq):
+    freq = to_supported_pandas_freq(freq)
+    df_original = get_data_frame_with_variable_lengths({"B": 15, "A": 20}, freq=freq, covariates_names=["Y", "X"])
+    cat_columns = ["cat_1", "cat_2"]
+    for col in cat_columns:
+        df_original[col] = np.random.choice(["foo", "bar", "baz"], size=len(df_original))
+    # Select random rows & reset cached freq
+    df_irregular = df_original.iloc[[2, 5, 7, 10, 14, 15, 16, 33]]
+    df_irregular._cached_freq = None
+    df_regular = df_irregular.convert_frequency(freq=freq)
+    assert all(col in df_regular.columns for col in cat_columns)
+    assert df_regular.freq == pd.tseries.frequencies.to_offset(freq).freqstr
+
+
+@pytest.mark.parametrize("dtype", ["datetime64[ns]", "datetime64[us]", "datetime64[ms]", "datetime64[s]"])
+def test_when_timestamps_have_datetime64_type_then_tsdf_can_be_constructed(dtype):
+    df = SAMPLE_DATAFRAME.copy()
+    df[TIMESTAMP] = df[TIMESTAMP].astype(dtype)
+    assert df[TIMESTAMP].dtype == dtype
+    TimeSeriesDataFrame.from_data_frame(df)
+
+
+def test_when_to_data_frame_called_then_return_values_is_a_pandas_df():
+    tsdf = SAMPLE_TS_DATAFRAME.copy()
+    df = tsdf.to_data_frame()
+    assert isinstance(df, pd.DataFrame)
+    assert not isinstance(df, TimeSeriesDataFrame)

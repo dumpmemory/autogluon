@@ -1,33 +1,37 @@
 import logging
 from typing import Callable, Dict, List, Optional, Union
 
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import torch
 import torchmetrics
+from lightning.pytorch.utilities import grad_norm
 from omegaconf import DictConfig
 from torch import nn
 from torch.nn.modules.loss import _Loss
 from torchmetrics.aggregation import BaseAggregator
 
-from ..constants import AUTOMM, FEATURES, PROBABILITY, QUERY, RESPONSE
+from ..constants import FEATURES, LOGIT_SCALE, PROBABILITY, QUERY, RESPONSE
+from ..models.utils import run_model
+from ..utils.matcher import compute_matching_probability
+from .losses import MultiNegativesSoftmaxLoss
 from .utils import (
+    CustomHitRate,
     apply_layerwise_lr_decay,
     apply_single_lr,
     apply_two_stages_lr,
-    compute_probability,
     generate_metric_learning_labels,
     get_lr_scheduler,
     get_optimizer,
 )
 
-logger = logging.getLogger(AUTOMM)
+logger = logging.getLogger(__name__)
 
 
 class MatcherLitModule(pl.LightningModule):
     """
     Control the loops for training, evaluation, and prediction. This module is independent of
     the model definition. This class inherits from the Pytorch Lightning's LightningModule:
-    https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html
+    https://lightning.ai/docs/pytorch/stable/common/lightning_module.html
     """
 
     def __init__(
@@ -52,6 +56,7 @@ class MatcherLitModule(pl.LightningModule):
         validation_metric_name: Optional[str] = None,
         custom_metric_func: Callable = None,
         test_metric: Optional[torchmetrics.Metric] = None,
+        track_grad_norm: Optional[Union[int, str]] = -1,
     ):
         """
         Parameters
@@ -114,6 +119,9 @@ class MatcherLitModule(pl.LightningModule):
             Refer to https://github.com/PyTorchLightning/metrics/blob/master/torchmetrics/aggregation.py
         test_metric
             A torchmetrics module used in the test stage, e.g., torchmetrics.Accuracy().
+        track_grad_norm
+            Track the p-norm of gradients during training. May be set to ‘inf’ infinity-norm.
+            If using Automatic Mixed Precision (AMP), the gradients will be unscaled before logging them.
         """
         super().__init__()
         self.save_hyperparameters(
@@ -151,30 +159,42 @@ class MatcherLitModule(pl.LightningModule):
 
         self.loss_func = loss_func
         self.miner_func = miner_func
+        self.track_grad_norm = track_grad_norm
 
     def _compute_loss(
         self,
         query_embeddings: torch.Tensor,
         response_embeddings: torch.Tensor,
         label: torch.Tensor,
+        logit_scale: Optional[torch.tensor] = None,
     ):
         assert query_embeddings.shape == response_embeddings.shape
-        embeddings = torch.cat([query_embeddings, response_embeddings], dim=0)  # (b*2, d)
 
-        metric_learning_labels = generate_metric_learning_labels(
-            num_samples=len(query_embeddings),
-            match_label=self.match_label,
-            labels=label,
-        )
-        indices_tuple = self.miner_func(
-            embeddings=embeddings,
-            labels=metric_learning_labels,
-        )
-        loss = self.loss_func(
-            embeddings=embeddings,
-            labels=metric_learning_labels,
-            indices_tuple=indices_tuple,
-        )
+        if isinstance(self.loss_func, MultiNegativesSoftmaxLoss):
+            loss = self.loss_func(
+                features_a=query_embeddings,
+                features_b=response_embeddings,
+                logit_scale=logit_scale,
+                rank=self.global_rank,
+                world_size=self.trainer.world_size,
+            )
+        else:
+            embeddings = torch.cat([query_embeddings, response_embeddings], dim=0)  # (b*2, d)
+
+            metric_learning_labels = generate_metric_learning_labels(
+                num_samples=len(query_embeddings),
+                match_label=self.match_label,
+                labels=label,
+            )
+            indices_tuple = self.miner_func(
+                embeddings=embeddings,
+                labels=metric_learning_labels,
+            )
+            loss = self.loss_func(
+                embeddings=embeddings,
+                labels=metric_learning_labels,
+                indices_tuple=indices_tuple,
+            )
 
         return loss
 
@@ -185,14 +205,20 @@ class MatcherLitModule(pl.LightningModule):
         label: torch.Tensor,
         query_embeddings: torch.Tensor,
         response_embeddings: torch.Tensor,
+        logit_scale: Optional[torch.Tensor] = None,
         reverse_prob: Optional[bool] = False,
     ):
-
         if isinstance(metric, BaseAggregator):
             metric.update(custom_metric_func(query_embeddings, response_embeddings, label))
+        elif isinstance(metric, CustomHitRate):
+            metric.update(
+                batch_query_embeds=query_embeddings,
+                batch_response_embeds=response_embeddings,
+                logit_scale=logit_scale if logit_scale else None,
+            )
         else:
             metric.update(
-                compute_probability(
+                compute_matching_probability(
                     embeddings1=query_embeddings,
                     embeddings2=response_embeddings,
                     reverse_prob=reverse_prob,
@@ -210,20 +236,29 @@ class MatcherLitModule(pl.LightningModule):
         self,
         batch: Dict,
     ):
-        query_embeddings = self.query_model(batch)[self.query_model.prefix][FEATURES]
-        response_embeddings = self.response_model(batch)[self.response_model.prefix][FEATURES]
+        query_outputs = run_model(self.query_model, batch)[self.query_model.prefix]
+        query_embeddings = query_outputs[FEATURES]
+
+        response_outputs = run_model(self.response_model, batch)[self.response_model.prefix]
+        response_embeddings = response_outputs[FEATURES]
+
+        logit_scale = (response_outputs[LOGIT_SCALE] if LOGIT_SCALE in response_outputs else None,)
+
+        if isinstance(logit_scale, tuple):
+            logit_scale = logit_scale[0]
 
         loss = self._compute_loss(
             query_embeddings=query_embeddings,
             response_embeddings=response_embeddings,
             label=self._get_label(batch),
+            logit_scale=logit_scale,
         )
-        return query_embeddings, response_embeddings, loss
+        return query_embeddings, response_embeddings, logit_scale, loss
 
     def training_step(self, batch, batch_idx):
         """
-        Per training step. This function is registered by pl.LightningModule.
-        Refer to https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html#training-loop
+        Per training step. This function is registered by LightningModule.
+        Refer to https://lightning.ai/docs/pytorch/stable/common/lightning_module.html#training-loop
 
         Parameters
         ----------
@@ -239,14 +274,14 @@ class MatcherLitModule(pl.LightningModule):
         -------
         Average loss of the mini-batch data.
         """
-        _, _, loss = self._shared_step(batch)
+        _, _, _, loss = self._shared_step(batch)
         self.log("train_loss", loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
         """
-        Per validation step. This function is registered by pl.LightningModule.
-        Refer to https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html#validation
+        Per validation step. This function is registered by LightningModule.
+        Refer to https://lightning.ai/docs/pytorch/stable/common/lightning_module.html#validation-loop
 
         Parameters
         ----------
@@ -259,7 +294,7 @@ class MatcherLitModule(pl.LightningModule):
         batch_idx
             Index of mini-batch.
         """
-        query_embeddings, response_embeddings, loss = self._shared_step(batch)
+        query_embeddings, response_embeddings, logit_scale, loss = self._shared_step(batch)
         # By default, on_step=False and on_epoch=True
         self.log("val_loss", loss)
 
@@ -269,6 +304,7 @@ class MatcherLitModule(pl.LightningModule):
             query_embeddings=query_embeddings,
             response_embeddings=response_embeddings,
             label=self._get_label(batch),
+            logit_scale=logit_scale,
             reverse_prob=self.reverse_prob,
         )
 
@@ -281,8 +317,8 @@ class MatcherLitModule(pl.LightningModule):
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         """
-        Per prediction step. This function is registered by pl.LightningModule.
-        Refer to https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html#prediction-loop
+        Per prediction step. This function is registered by LightningModule.
+        Refer to https://lightning.ai/docs/pytorch/stable/common/lightning_module.html#prediction-loop
 
         Parameters
         ----------
@@ -300,16 +336,16 @@ class MatcherLitModule(pl.LightningModule):
         A dictionary with the mini-batch's logits and features.
         """
         if self.signature == QUERY:
-            embeddings = self.query_model(batch)[self.query_model.prefix][FEATURES]
+            embeddings = run_model(self.query_model, batch)[self.query_model.prefix][FEATURES]
             return {FEATURES: embeddings}
         elif self.signature == RESPONSE:
-            embeddings = self.response_model(batch)[self.response_model.prefix][FEATURES]
+            embeddings = run_model(self.response_model, batch)[self.response_model.prefix][FEATURES]
             return {FEATURES: embeddings}
         else:
-            query_embeddings = self.query_model(batch)[self.query_model.prefix][FEATURES]
-            response_embeddings = self.response_model(batch)[self.response_model.prefix][FEATURES]
+            query_embeddings = run_model(self.query_model, batch)[self.query_model.prefix][FEATURES]
+            response_embeddings = run_model(self.response_model, batch)[self.response_model.prefix][FEATURES]
 
-        match_prob = compute_probability(
+        match_prob = compute_matching_probability(
             embeddings1=query_embeddings,
             embeddings2=response_embeddings,
         )
@@ -322,8 +358,8 @@ class MatcherLitModule(pl.LightningModule):
 
     def configure_optimizers(self):
         """
-        Configure optimizer. This function is registered by pl.LightningModule.
-        Refer to https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html#configure-optimizers
+        Configure optimizer. This function is registered by LightningModule.
+        Refer to https://lightning.ai/docs/pytorch/stable/common/lightning_module.html#configure-optimizers
         Returns
         -------
         [optimizer]
@@ -333,7 +369,7 @@ class MatcherLitModule(pl.LightningModule):
         """
         # TODO: need to consider query_model and response_model in the optimizer
         # TODO: how to avoid pass one parameter multiple times in the optimizer?
-        # TODO: in the late-fusion siamese setting, one shared parameter may have different layer ids in the query and reponse models.
+        # TODO: in the late-fusion siamese setting, one shared parameter may have different layer ids in the query and response models.
         kwargs = dict(
             model=self.query_model,
             lr=self.hparams.lr,
@@ -399,3 +435,8 @@ class MatcherLitModule(pl.LightningModule):
         sched = {"scheduler": scheduler, "interval": "step"}
         logger.debug("done configuring optimizer and scheduler")
         return [optimizer], [sched]
+
+    def on_before_optimizer_step(self, optimizer):
+        # If using mixed precision, the gradients are already unscaled here
+        if self.track_grad_norm != -1:
+            self.log_dict(grad_norm(self, norm_type=self.track_grad_norm))

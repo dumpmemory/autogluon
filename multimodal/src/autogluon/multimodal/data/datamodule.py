@@ -1,10 +1,10 @@
 from typing import Dict, List, Optional, Union
 
 import pandas as pd
-from pytorch_lightning import LightningDataModule
-from torch.utils.data import DataLoader
+from lightning.pytorch import LightningDataModule
+from torch.utils.data import DataLoader, Dataset
 
-from ..constants import PREDICT, TEST, TRAIN, VAL
+from ..constants import PREDICT, TEST, TRAIN, VALIDATE
 from .dataset import BaseDataset
 from .preprocess_dataframe import MultiModalFeaturePreprocessor
 from .utils import get_collate_fn
@@ -16,7 +16,7 @@ class BaseDataModule(LightningDataModule):
     validation, testing, and prediction. We organize the multimodal data using pd.DataFrame.
     For some modalities, e.g, image, that cost much memory, we only store their disk path to do lazy loading.
     This class inherits from the Pytorch Lightning's LightningDataModule:
-    https://pytorch-lightning.readthedocs.io/en/latest/extensions/datamodules.html
+    https://lightning.ai/docs/pytorch/stable/data/datamodule.html
     """
 
     def __init__(
@@ -26,10 +26,11 @@ class BaseDataModule(LightningDataModule):
         per_gpu_batch_size: int,
         num_workers: int,
         train_data: Optional[pd.DataFrame] = None,
-        val_data: Optional[pd.DataFrame] = None,
+        train_dataset: Optional[Dataset] = None,
+        validate_data: Optional[pd.DataFrame] = None,
         test_data: Optional[pd.DataFrame] = None,
         predict_data: Optional[pd.DataFrame] = None,
-        id_mappings: Optional[Dict[str, Dict]] = None,
+        id_mappings: Optional[Union[Dict[str, Dict], Dict[str, pd.Series]]] = None,
         val_use_training_mode: bool = False,
     ):
         """
@@ -50,19 +51,21 @@ class BaseDataModule(LightningDataModule):
             Number of workers for Pytorch DataLoader.
         train_data
             Training data.
-        val_data
+        train_dataset
+            Training dataset.
+        validate_data
             Validation data.
         test_data
             Test data.
         predict_data
             Prediction data. No labels required in it.
         id_mappings
-             Id-to-content mappings. The contents can be text, image, etc.
-             This is used when the dataframe contains the query/response indexes instead of their contents.
+            Id-to-content mappings. The contents can be text, image, etc.
+            This is used when the dataframe contains the query/response indexes instead of their contents.
         val_use_training_mode
-             whether we are triggering is_training when creating the dataset for validation.
-             This is used when we want to use val_loss as val metric, and thus we'll use data pipeline
-             for training instead of for inference during validation.
+            whether we are triggering is_training when creating the dataset for validation.
+            This is used when we want to use val_loss as val metric, and thus we'll use data pipeline
+            for training instead of for inference during validation.
         """
         super().__init__()
         self.prepare_data_per_node = True
@@ -77,18 +80,23 @@ class BaseDataModule(LightningDataModule):
         self.per_gpu_batch_size = per_gpu_batch_size
         self.num_workers = num_workers
         self.train_data = train_data
-        self.val_data = val_data
+        self.train_dataset = train_dataset
+        self.validate_data = validate_data
         self.test_data = test_data
         self.predict_data = predict_data
         self.id_mappings = id_mappings
         self.val_use_training_mode = val_use_training_mode
 
     def set_dataset(self, split):
-        data_split = getattr(self, f"{split}_data")
         if self.val_use_training_mode:
-            is_training = split in [TRAIN, VAL]
+            is_training = split in [TRAIN, VALIDATE]
         else:
             is_training = split == TRAIN
+
+        if is_training and self.train_dataset is not None:
+            return
+
+        data_split = getattr(self, f"{split}_data")
         dataset = BaseDataset(
             data=data_split,
             preprocessor=self.df_preprocessor,
@@ -103,7 +111,7 @@ class BaseDataModule(LightningDataModule):
         """
         Set up datasets for different stages: "fit" (training and validation), "test", and "predict".
         This method is registered by Pytorch Lightning's LightningDataModule.
-        Refer to: https://pytorch-lightning.readthedocs.io/en/latest/extensions/datamodules.html#setup
+        Refer to: https://lightning.ai/docs/pytorch/stable/data/datamodule.html#setup
 
         Parameters
         ----------
@@ -115,7 +123,9 @@ class BaseDataModule(LightningDataModule):
         """
         if stage == "fit":
             self.set_dataset(TRAIN)
-            self.set_dataset(VAL)
+            self.set_dataset(VALIDATE)
+        elif stage == "validate":
+            self.set_dataset(VALIDATE)
         elif stage == "test":
             self.set_dataset(TEST)
         elif stage == "predict":
@@ -127,7 +137,7 @@ class BaseDataModule(LightningDataModule):
         """
         Create the dataloader for training.
         This method is registered by Pytorch Lightning's LightningDataModule.
-        Refer to: https://pytorch-lightning.readthedocs.io/en/latest/extensions/datamodules.html#train-dataloader
+        Refer to: https://lightning.ai/docs/pytorch/stable/data/datamodule.html#train-dataloader
 
         Returns
         -------
@@ -144,6 +154,7 @@ class BaseDataModule(LightningDataModule):
                 data_processors=self.data_processors,
                 per_gpu_batch_size=self.per_gpu_batch_size,
             ),
+            persistent_workers=self.num_workers > 0,
         )
         return loader
 
@@ -151,14 +162,14 @@ class BaseDataModule(LightningDataModule):
         """
         Create the dataloader for validation.
         This method is registered by Pytorch Lightning's LightningDataModule.
-        Refer to: https://pytorch-lightning.readthedocs.io/en/latest/extensions/datamodules.html#val-dataloader
+        Refer to: https://lightning.ai/docs/pytorch/stable/data/datamodule.html#val-dataloader
 
         Returns
         -------
         A Pytorch DataLoader object.
         """
         loader = DataLoader(
-            self.val_dataset,
+            self.validate_dataset,
             batch_size=self.per_gpu_batch_size,
             num_workers=self.num_workers,
             pin_memory=False,
@@ -167,6 +178,7 @@ class BaseDataModule(LightningDataModule):
                 data_processors=self.data_processors,
                 per_gpu_batch_size=self.per_gpu_batch_size,
             ),
+            persistent_workers=self.num_workers > 0,
         )
         return loader
 
@@ -174,7 +186,7 @@ class BaseDataModule(LightningDataModule):
         """
         Create the dataloader for test.
         This method is registered by Pytorch Lightning's LightningDataModule.
-        Refer to: https://pytorch-lightning.readthedocs.io/en/latest/extensions/datamodules.html#test-dataloader
+        Refer to: https://lightning.ai/docs/pytorch/stable/data/datamodule.html#test-dataloader
 
         Returns
         -------
@@ -190,6 +202,7 @@ class BaseDataModule(LightningDataModule):
                 data_processors=self.data_processors,
                 per_gpu_batch_size=self.per_gpu_batch_size,
             ),
+            persistent_workers=self.num_workers > 0,
         )
         return loader
 
@@ -197,7 +210,7 @@ class BaseDataModule(LightningDataModule):
         """
         Create the dataloader for prediction.
         This method is registered by Pytorch Lightning's LightningDataModule.
-        Refer to: https://pytorch-lightning.readthedocs.io/en/latest/extensions/datamodules.html#predict-dataloader
+        Refer to: https://lightning.ai/docs/pytorch/stable/data/datamodule.html#predict-dataloader
 
         Returns
         -------
@@ -213,5 +226,6 @@ class BaseDataModule(LightningDataModule):
                 data_processors=self.data_processors,
                 per_gpu_batch_size=self.per_gpu_batch_size,
             ),
+            persistent_workers=self.num_workers > 0,
         )
         return loader

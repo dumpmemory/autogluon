@@ -13,6 +13,12 @@ on:
       pr-sha:
         description: 'The pr-sha of which the slash command was dispatched'
         required: true
+      branch_or_pr_number:
+        description: 'dummy parameter to allow benchmark workflow to run'
+        required: false
+      fork_info:
+        description: 'Get info of forked repository and branch'
+        required: false
 
 jobs:
   setup:
@@ -25,9 +31,9 @@ jobs:
 
       - name: Create comment
         if: (github.event_name == 'workflow_dispatch')
-        uses: peter-evans/create-or-update-comment@v1
+        uses: peter-evans/create-or-update-comment@v4
         with:
-          token: ${{ secrets.PAT }}
+          token: ${{ secrets.CICD_PAT }}
           repository: ${{ github.event.inputs.repository }}
           comment-id: ${{ github.event.inputs.comment-id }}
           body: |
@@ -44,7 +50,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-latest, windows-latest, ubuntu-latest]
+        python: ["3.9", "3.10", "3.11", "3.12"]
     steps:  
       - name: Checkout repository for PR
         if: (github.event_name == 'workflow_dispatch')
@@ -55,12 +62,13 @@ jobs:
         if: (github.event_name == 'schedule')
         uses: actions/checkout@v2
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@v2.0.0
+        uses: conda-incubator/setup-miniconda@v3
         with:
           activate-environment: autogluon_py3
           environment-file: .github/workflows_env/unittest_env.yml
           auto-update-conda: true
-          python-version: 3.9
+          python-version: ${{ matrix.python }}
+          miniconda-version: "latest"
       - name: unit-test
         shell: bash -l {0}
         run: |
@@ -75,7 +83,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-latest, windows-latest, ubuntu-latest]
+        python: ["3.9", "3.10", "3.11", "3.12"]
     steps:
       - name: Checkout repository for PR
         if: (github.event_name == 'workflow_dispatch')
@@ -86,12 +95,13 @@ jobs:
         if: (github.event_name == 'schedule')
         uses: actions/checkout@v2
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@v2.0.0
+        uses: conda-incubator/setup-miniconda@v3
         with:
           activate-environment: autogluon_py3
           environment-file: .github/workflows_env/unittest_env.yml
           auto-update-conda: true
-          python-version: 3.9
+          python-version: ${{ matrix.python }}
+          miniconda-version: "latest"
       - name: unit-test
         shell: bash -l {0}
         run: |
@@ -106,7 +116,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-latest, windows-latest, ubuntu-latest]
+        python: ["3.9", "3.10", "3.11", "3.12"]
     steps:
       - name: Checkout repository for PR
         if: (github.event_name == 'workflow_dispatch')
@@ -117,59 +128,62 @@ jobs:
         if: (github.event_name == 'schedule')
         uses: actions/checkout@v2
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@v2.0.0
+        uses: conda-incubator/setup-miniconda@v3
         with:
           activate-environment: autogluon_py3
           environment-file: .github/workflows_env/unittest_env.yml
           auto-update-conda: true
-          python-version: 3.9
+          python-version: ${{ matrix.python }}
+          miniconda-version: "latest"
       - name: unit-test
         shell: bash -l {0}
         run: |
           chmod +x ./.github/workflow_scripts/test_features.sh && ./.github/workflow_scripts/test_features.sh
 
-  eda:
-    needs: setup
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        shell: bash
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    steps:
-      - name: Checkout repository for PR
-        if: (github.event_name == 'workflow_dispatch')
-        uses: actions/checkout@v2
-        with:
-          ref: ${{ github.event.inputs.pr-sha }}
-      - name: Checkout repository for nightly test
-        if: (github.event_name == 'schedule')
-        uses: actions/checkout@v2
-      - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@v2.0.0
-        with:
-          activate-environment: autogluon_py3
-          environment-file: .github/workflows_env/unittest_env.yml
-          auto-update-conda: true
-          python-version: 3.9
-      - name: unit-test
-        shell: bash -l {0}
-        run: |
-          chmod +x ./.github/workflow_scripts/test_eda.sh && ./.github/workflow_scripts/test_eda.sh
+  # eda:
+  #   needs: setup
+  #   runs-on: ${{ matrix.os }}
+  #   defaults:
+  #     run:
+  #       shell: bash
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       os: [macos-latest, windows-latest, ubuntu-latest]
+  #       python: ["3.9", "3.10", "3.11", "3.12"]
+  #   steps:
+  #     - name: Checkout repository for PR
+  #       if: (github.event_name == 'workflow_dispatch')
+  #       uses: actions/checkout@v2
+  #       with:
+  #         ref: ${{ github.event.inputs.pr-sha }}
+  #     - name: Checkout repository for nightly test
+  #       if: (github.event_name == 'schedule')
+  #       uses: actions/checkout@v2
+  #     - name: Setup Miniconda
+  #       uses: conda-incubator/setup-miniconda@v3
+  #       with:
+  #         activate-environment: autogluon_py3
+  #         environment-file: .github/workflows_env/unittest_env.yml
+  #         auto-update-conda: true
+  #         python-version: ${{ matrix.python }}
+  #     - name: unit-test
+  #       shell: bash -l {0}
+  #       run: |
+  #         chmod +x ./.github/workflow_scripts/test_eda.sh && ./.github/workflow_scripts/test_eda.sh
 
   tabular:
     needs: setup
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-latest, windows-latest, ubuntu-latest]
+        python: ["3.9", "3.10", "3.11", "3.12"]
     steps:
       - name: Checkout repository for PR
         if: (github.event_name == 'workflow_dispatch')
@@ -180,24 +194,73 @@ jobs:
         if: (github.event_name == 'schedule')
         uses: actions/checkout@v2
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@v2.0.0
+        uses: conda-incubator/setup-miniconda@v3
         with:
           activate-environment: autogluon_py3
           environment-file: .github/workflows_env/unittest_env.yml
           auto-update-conda: true
-          python-version: 3.9
+          python-version: ${{ matrix.python }}
+          miniconda-version: "latest"
       - name: Setup OMP
         if: matrix.os == 'macos-latest'
         shell: bash -l {0}
         run: |
           wget https://raw.githubusercontent.com/Homebrew/homebrew-core/fb8323f2b170bd4ae97e1bac9bf3e2983af3fdb0/Formula/libomp.rb
-          brew unlink libomp
+          if brew list | grep -q libomp; then
+            brew unlink libomp
+          fi
           brew install libomp.rb
           rm libomp.rb
       - name: unit-test
         shell: bash -l {0}
         run: |
-          chmod +x ./.github/workflow_scripts/test_tabular.sh && ./.github/workflow_scripts/test_tabular.sh "-m not gpu"
+          conda install --channel conda-forge pygraphviz
+          chmod +x ./.github/workflow_scripts/test_tabular.sh && ./.github/workflow_scripts/test_tabular.sh "-m not gpu" "true"
+
+  timeseries:
+    needs: setup
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+        python: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - name: Checkout repository for PR
+        if: (github.event_name == 'workflow_dispatch')
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.inputs.pr-sha }}
+      - name: Checkout repository for nightly test
+        if: (github.event_name == 'schedule')
+        uses: actions/checkout@v2
+      - name: Setup Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: autogluon_py3
+          environment-file: .github/workflows_env/unittest_env.yml
+          auto-update-conda: true
+          python-version: ${{ matrix.python }}
+          miniconda-version: "latest"
+      - name: Setup OMP
+        if: matrix.os == 'macos-latest'
+        shell: bash -l {0}
+        run: |
+          wget https://raw.githubusercontent.com/Homebrew/homebrew-core/fb8323f2b170bd4ae97e1bac9bf3e2983af3fdb0/Formula/libomp.rb
+          if brew list | grep -q libomp; then
+            brew unlink libomp
+          fi
+          brew install libomp.rb
+          rm libomp.rb
+      - name: unit-test
+        shell: bash -l {0}
+        run: |
+          conda install --channel conda-forge pygraphviz
+          chmod +x ./.github/workflow_scripts/test_timeseries.sh && ./.github/workflow_scripts/test_timeseries.sh "-m not gpu" "true"
 
   install:
     needs: setup
@@ -208,7 +271,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-latest, windows-latest, ubuntu-latest]
+        python: ["3.9", "3.10", "3.11", "3.12"]
     steps:
       - name: Checkout repository for PR
         if: (github.event_name == 'workflow_dispatch')
@@ -219,16 +283,20 @@ jobs:
         if: (github.event_name == 'schedule')
         uses: actions/checkout@v2
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@v2.0.0
+        uses: conda-incubator/setup-miniconda@v3
         with:
           activate-environment: autogluon_py3
           environment-file: .github/workflows_env/unittest_env.yml
           auto-update-conda: true
-          python-version: 3.9
+          python-version: ${{ matrix.python }}
+          miniconda-version: "latest"
       - name: unit-test
+        if: matrix.os != 'windows-latest'
         shell: bash -l {0}
         run: |
-          # test_install.sh script will install mxnet, which doesn't work on Windows.
-          source .github/workflow_scripts/env_setup.sh
-          setup_build_env
-          install_all
+          chmod +x ./.github/workflow_scripts/test_install.sh && ./.github/workflow_scripts/test_install.sh
+      - name: unit-test on Windows
+        if: matrix.os == 'windows-latest'
+        shell: bash -l {0}
+        run: |
+          chmod +x ./.github/workflow_scripts/test_install_windows.sh && ./.github/workflow_scripts/test_install_windows.sh

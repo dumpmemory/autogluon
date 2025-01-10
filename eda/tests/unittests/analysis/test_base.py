@@ -5,24 +5,28 @@ import pytest
 
 from autogluon.eda import AnalysisState
 from autogluon.eda.analysis import Namespace
-from autogluon.eda.analysis.base import BaseAnalysis
+from autogluon.eda.analysis.base import AbstractAnalysis, BaseAnalysis, SaveArgsToState
 
 
 def test_abstractanalysis_parameter_shadowing():
     a: BaseAnalysis = BaseAnalysis(
-        x='x', y='y',
+        x="x",
+        y="y",
         children=[
-            BaseAnalysis(x='q'),
-            BaseAnalysis(x='w', children=[
-                BaseAnalysis(x='z', q='q'),
-            ]),
-        ]
+            BaseAnalysis(x="q"),
+            BaseAnalysis(
+                x="w",
+                children=[
+                    BaseAnalysis(x="z", q="q"),
+                ],
+            ),
+        ],
     )
 
-    assert a._gather_args() == {'x': 'x', 'y': 'y'}
-    assert a.children[0]._gather_args() == {'x': 'q', 'y': 'y'}
-    assert a.children[1]._gather_args() == {'x': 'w', 'y': 'y'}
-    assert a.children[1].children[0]._gather_args() == {'x': 'z', 'y': 'y', 'q': 'q'}
+    assert a._gather_args() == {"x": "x", "y": "y"}
+    assert a.children[0]._gather_args() == {"x": "q", "y": "y"}
+    assert a.children[1]._gather_args() == {"x": "w", "y": "y"}
+    assert a.children[1].children[0]._gather_args() == {"x": "z", "y": "y", "q": "q"}
 
 
 def test_abstractanalysis_available_datasets():
@@ -89,8 +93,8 @@ def test_abstractanalysis_fit_gathers_args():
     assert inner_analysis.state is state
     assert outer_analysis.state is state
 
-    outer_analysis._fit.assert_called_once_with({}, {'b': 3, 'c': 4}, arg_a=10, arg_b=11)
-    inner_analysis._fit.assert_called_once_with({}, {'a': 1, 'b': 2, 'c': 4}, arg_a=10, arg_b=11)
+    outer_analysis._fit.assert_called_once_with({}, {"b": 3, "c": 4}, arg_a=10, arg_b=11)
+    inner_analysis._fit.assert_called_once_with({}, {"a": 1, "b": 2, "c": 4}, arg_a=10, arg_b=11)
 
 
 def test_namespaces():
@@ -102,18 +106,36 @@ def test_namespaces():
     inner_analysis._fit.side_effect = side_effect
 
     # write outputs into ns1
-    state = BaseAnalysis(children=[
-        Namespace(namespace='ns1', children=[inner_analysis])
-    ]).fit(op='fit1')
+    state = BaseAnalysis(children=[Namespace(namespace="ns1", children=[inner_analysis])]).fit(op="fit1")
 
     # write outputs into ns2
-    state = BaseAnalysis(state=state, children=[
-        Namespace(namespace='ns2', children=[inner_analysis])
-    ]).fit(op='fit2')
+    state = BaseAnalysis(state=state, children=[Namespace(namespace="ns2", children=[inner_analysis])]).fit(op="fit2")
 
     # update outputs in ns2
-    state = BaseAnalysis(state=state, children=[
-        Namespace(namespace='ns2', children=[inner_analysis])
-    ]).fit(op='fit3')
+    state = BaseAnalysis(state=state, children=[Namespace(namespace="ns2", children=[inner_analysis])]).fit(op="fit3")
 
-    assert state == {'ns1': {'upd': {'op': 'fit1'}}, 'ns2': {'upd': {'op': 'fit3'}}}
+    assert state == {"ns1": {"upd": {"op": "fit1"}}, "ns2": {"upd": {"op": "fit3"}}}
+
+
+def test_SaveArgsToState():
+    train_data = list("abc")
+
+    class SomeTransform(AbstractAnalysis):
+        def can_handle(self, state: AnalysisState, args: AnalysisState) -> bool:
+            return True
+
+        def _fit(self, state: AnalysisState, args: AnalysisState, **fit_kwargs) -> None:
+            print(args)
+            self.args["train_data"] = [c.upper() for c in args["train_data"]]
+
+    state = BaseAnalysis(
+        train_data=train_data,
+        children=[SomeTransform(children=[SaveArgsToState(params_mapping={"train_data": "result_arg"})])],
+    ).fit()
+
+    assert state.result_arg == ["A", "B", "C"]
+
+
+def test_SaveArgsToState__no_key():
+    state = BaseAnalysis(children=[SaveArgsToState(params_mapping={"train_data": "result_arg"})]).fit()
+    assert state.result_arg is None

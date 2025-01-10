@@ -1,6 +1,8 @@
 import json
+from collections import OrderedDict
 from json import JSONDecodeError
 from typing import List
+from typing import OrderedDict as t_OrderedDict
 
 
 class Registry:
@@ -17,7 +19,10 @@ class Registry:
             Registry name
         """
         self._name: str = name
-        self._obj_map: dict[str, object] = dict()
+        self._obj_map: t_OrderedDict[str, object] = OrderedDict()
+
+    def __contains__(self, item):
+        return item in self._obj_map
 
     def _do_register(self, name: str, obj: object) -> None:
         assert name not in self._obj_map, "An object named '{}' was already registered in '{}' registry!".format(
@@ -105,6 +110,7 @@ class Registry:
             return self.create(name, **args)
         else:
             raise NotImplementedError(
-                "The format of json string is not supported! We only support "
-                'list/dict. json_str="{}".'.format(json_str)
+                "The format of json string is not supported! We only support " 'list/dict. json_str="{}".'.format(
+                    json_str
+                )
             )

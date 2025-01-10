@@ -1,4 +1,4 @@
-FROM 763104351884.dkr.ecr.us-east-1.amazonaws.com/autogluon-training:0.5.2-gpu-py38-cu112-ubuntu20.04
+FROM 763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training:2.4.0-gpu-py311-cu124-ubuntu22.04-ec2
 
 ARG AWSCLI_VER=1.22.45
 
@@ -6,9 +6,13 @@ RUN apt-get update \
  && apt-get -y upgrade \
  && apt-get install -y --no-install-recommends \
     pandoc \
-    python3.8-venv \
+    python3.11-venv \
+    graphviz \
+    graphviz-dev \
  && apt-get autoremove -y \
  && apt-get clean
+
+RUN apt install tesseract-ocr -y
 
 RUN adduser --disabled-password --disabled-login ci
 WORKDIR /home/ci

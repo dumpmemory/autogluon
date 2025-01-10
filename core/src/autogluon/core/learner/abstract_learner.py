@@ -1,11 +1,11 @@
 import os
 import random
 import sys
-from typing import Type, Optional
+from typing import Optional, Type
 
 from autogluon.core.trainer import AbstractTrainer
 from autogluon.core.utils.loaders import load_pkl
-from autogluon.core.utils.savers import save_pkl, save_json
+from autogluon.core.utils.savers import save_json, save_pkl
 
 
 class AbstractLearner:
@@ -21,10 +21,9 @@ class AbstractLearner:
     learner_file_name = "learner.pkl"
 
     def __init__(self, path_context: str, random_state: int = 0, **kwargs):
-        self.path, self.model_context, self.save_path = self.create_contexts(
-            path_context
-        )
+        self.path, self.model_context, self.save_path = self.create_contexts(path_context)
 
+        self.path_context_og: str = path_context  # Saves path_context used to create the original context of the learner to enable sub-fits.
         self.is_trainer_present: bool = False
         self.trainer: Optional[AbstractTrainer] = None
         self.trainer_type: Optional[Type] = None
@@ -51,16 +50,14 @@ class AbstractLearner:
         path_context: str
             Top-level directory where models and trainer will be saved.
         """
-        model_context = os.path.join(path_context, "models") + os.path.sep
+        model_context = os.path.join(path_context, "models")
         save_path = os.path.join(path_context, self.learner_file_name)
         return path_context, model_context, save_path
 
     def set_contexts(self, path_context: str):
         """Update the path where model, learner, and trainer objects will be saved.
         Also see `create_contexts`."""
-        self.path, self.model_context, self.save_path = self.create_contexts(
-            path_context
-        )
+        self.path, self.model_context, self.save_path = self.create_contexts(path_context)
 
     @property
     def is_fit(self):
@@ -90,7 +87,7 @@ class AbstractLearner:
 
     @classmethod
     def load(cls, path_context, reset_paths=True):
-        load_path = path_context + cls.learner_file_name
+        load_path = os.path.join(path_context, cls.learner_file_name)
         obj = load_pkl.load(path=load_path)
         if reset_paths:
             obj.set_contexts(path_context)
@@ -117,16 +114,16 @@ class AbstractLearner:
         else:
             if self.trainer_path is None:
                 raise AssertionError("Trainer does not exist.")
-            return self.trainer_type.load(  # noqa
-                path=self.trainer_path, reset_paths=self.reset_paths
-            )
+            # trainer_path is used to determine if there's a trained trainer
+            # model_context contains the new trainer_path with updated context
+            return self.trainer_type.load(path=self.model_context, reset_paths=self.reset_paths)  # noqa
 
     # reset_paths=True if the learner files have changed location since fitting.
     # TODO: Potentially set reset_paths=False inside load function if it is the same path to
     # TODO: avoid re-computing paths on all models path_context -> path for v0.1
     @classmethod
     def load_info(cls, path, reset_paths=True, load_model_if_required=True):
-        load_path = path + cls.learner_info_name
+        load_path = os.path.join(path, cls.learner_info_name)
         try:
             return load_pkl.load(path=load_path)
         except Exception as e:
@@ -139,8 +136,8 @@ class AbstractLearner:
     def save_info(self, include_model_info=False):
         info = self.get_info(include_model_info=include_model_info)
 
-        save_pkl.save(path=self.path + self.learner_info_name, object=info)
-        save_json.save(path=self.path + self.learner_info_json_name, obj=info)
+        save_pkl.save(path=os.path.join(self.path, self.learner_info_name), object=info)
+        save_json.save(path=os.path.join(self.path, self.learner_info_json_name), obj=info)
         return info
 
     def get_info(self, **kwargs):

@@ -12,14 +12,21 @@ from ..constants import (
     IMAGE,
     IMAGE_VALID_NUM,
     LABEL,
+    LOGIT_SCALE,
     LOGITS,
     MASKS,
     TEXT_TOKEN_IDS,
     TEXT_VALID_LENGTH,
 )
-from .utils import assign_layer_ids, get_column_features, get_hf_config_and_model, init_weights
+from .utils import (
+    assign_layer_ids,
+    get_column_features,
+    get_hf_config_and_model,
+    get_pretrained_tokenizer,
+    init_weights,
+)
 
-logger = logging.getLogger(AUTOMM)
+logger = logging.getLogger(__name__)
 
 
 class CLIPForImageText(nn.Module):
@@ -34,6 +41,7 @@ class CLIPForImageText(nn.Module):
         checkpoint_name: str,
         num_classes: Optional[int] = None,
         pretrained: Optional[bool] = True,
+        tokenizer_name: Optional[str] = "clip",
     ):
         """
         Load the pretrained CLIP from huggingface transformers.
@@ -48,6 +56,8 @@ class CLIPForImageText(nn.Module):
             The number of classes. 1 for a regression task.
         pretrained
             Whether using the pretrained weights. If pretrained=True, download the pretrained model.
+        tokenizer_name
+            Name of the huggingface tokenizer type.
         """
         super().__init__()
         logger.debug(f"initializing {checkpoint_name}")
@@ -55,6 +65,11 @@ class CLIPForImageText(nn.Module):
         self.num_classes = num_classes
 
         self.config, self.model = get_hf_config_and_model(checkpoint_name=checkpoint_name, pretrained=pretrained)
+        self.tokenizer_name = tokenizer_name
+        self.tokenizer = get_pretrained_tokenizer(
+            tokenizer_name=self.tokenizer_name,
+            checkpoint_name=self.checkpoint_name,
+        )
 
         self.out_features = self.model.config.projection_dim
 
@@ -138,7 +153,7 @@ class CLIPForImageText(nn.Module):
             image_features = image_features.reshape((b, n, -1)) * image_masks[:, :, None]  # (b, n, num_features)
 
             # normalized features
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            image_features = image_features / torch.clamp(image_features.norm(dim=-1, keepdim=True), min=1e-6)
 
             # collect image features by image column names
             image_column_features, image_column_feature_masks = get_column_features(
@@ -151,6 +166,7 @@ class CLIPForImageText(nn.Module):
             ret[COLUMN_FEATURES][MASKS].update(image_column_feature_masks)
 
             image_features = image_features.mean(dim=1)  # (b, num_features)
+            ret[FEATURES] = image_features
 
         if has_text:
             text_token_ids = batch[self.text_token_ids_key]
@@ -181,6 +197,7 @@ class CLIPForImageText(nn.Module):
             )
             ret[COLUMN_FEATURES][FEATURES].update(text_column_features)
             ret[COLUMN_FEATURES][MASKS].update(text_column_feature_masks)
+            ret[FEATURES] = text_features
 
         if has_image and has_text:
             if self.num_classes:
@@ -192,6 +209,8 @@ class CLIPForImageText(nn.Module):
                 logits = torch.sum(image_features * text_features, dim=-1)
 
             ret[LOGITS] = logits
+
+        ret[LOGIT_SCALE] = self.model.logit_scale.exp()
 
         return {self.prefix: ret}
 

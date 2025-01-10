@@ -1,13 +1,40 @@
+import logging
 import re
+import warnings
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch._dynamo
+import torch.nn.functional as F
 from torch import nn
 from torch.nn.modules.loss import _Loss
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModel, AutoTokenizer, BertTokenizer, CLIPTokenizer, ElectraTokenizer
+from transformers.models.mask2former.modeling_mask2former import Mask2FormerLoss
 
-from ..constants import LOGITS, REGRESSION
-from .adaptation_layers import IA3Linear, LoRALinear
+from ..constants import (
+    AUTOMM,
+    CLASS_LOGITS,
+    COLUMN_FEATURES,
+    FEATURES,
+    LOGITS,
+    MASKS,
+    OCR,
+    PEFT_ADDITIVE_STRATEGIES,
+    REGRESSION,
+    SEMANTIC_MASK,
+    SEMANTIC_SEGMENTATION,
+)
+from .adaptation_layers import ConvLoRALinear, IA3Linear, IA3LoRALinear, LoRALinear
+
+logger = logging.getLogger(__name__)
+
+
+ALL_TOKENIZERS = {
+    "bert": BertTokenizer,
+    "clip": CLIPTokenizer,
+    "electra": ElectraTokenizer,
+    "hf_auto": AutoTokenizer,
+}
 
 
 class DummyLayer(nn.Module):
@@ -120,7 +147,7 @@ def assign_non_encoder_layer_ids(
     return name_to_id
 
 
-def split_encoder_non_encoder(names: List[str]):
+def split_encoder_non_encoder(names: List[str], post_encoder_patterns: Tuple[str, ...]):
     """
     Group layer names into two types: encoder and non-encoder.
     A layer belongs to encoder if its name contains at least one digit.
@@ -143,6 +170,9 @@ def split_encoder_non_encoder(names: List[str]):
     non_encoder_names = []
     for n in names:
         is_encoder = False
+        if any(p in n for p in post_encoder_patterns):
+            non_encoder_names.append(n)
+            continue
         for i in n.split("."):
             if i.isdigit():
                 encoder_names.append(n)
@@ -207,8 +237,11 @@ def group_param_names(
     # split blocks at the first level
     children_prefix = []
     for n in selected_names:
-        child_name = n[len(model_prefix) + 1 :].split(".")[0]
-        child_prefix = f"{model_prefix}.{child_name}"
+        if model_prefix is not None:
+            child_name = n[len(model_prefix) + 1 :].split(".")[0]
+            child_prefix = f"{model_prefix}.{child_name}"
+        else:
+            child_prefix = n.split(".")[0]
         if child_prefix not in children_prefix:
             children_prefix.append(child_prefix)
 
@@ -216,7 +249,7 @@ def group_param_names(
     non_encoder_names = []
     for child_prefix in children_prefix:
         per_names_group = [n for n in selected_names if n.startswith(child_prefix)]
-        per_encoder_names, per_non_encoder_names = split_encoder_non_encoder(per_names_group)
+        per_encoder_names, per_non_encoder_names = split_encoder_non_encoder(per_names_group, post_encoder_patterns)
         encoder_names_grouped.append(per_encoder_names)
         non_encoder_names.extend(per_non_encoder_names)
 
@@ -302,31 +335,39 @@ def assign_layer_ids(
     left_names
         The layer names not starting with the "model_pre".
     """
-    left_names, encoder_names, pre_encoder_names, post_encoder_names = group_param_names(
-        names=names,
-        pre_encoder_patterns=pre_encoder_patterns,
-        post_encoder_patterns=post_encoder_patterns,
-        model_prefix=model_pre,
-    )
-    # add a constraint
-    if len(encoder_names) == 0 and len(pre_encoder_names) != 0:
-        raise ValueError(f"encoder_names is empty, but pre_encoder_names has values: {pre_encoder_names}")
+    try:
+        left_names, encoder_names, pre_encoder_names, post_encoder_names = group_param_names(
+            names=names,
+            pre_encoder_patterns=pre_encoder_patterns,
+            post_encoder_patterns=post_encoder_patterns,
+            model_prefix=model_pre,
+        )
+        # add a constraint
+        if len(encoder_names) == 0 and len(pre_encoder_names) != 0:
+            raise ValueError(f"encoder_names is empty, but pre_encoder_names has values: {pre_encoder_names}")
 
-    encoder_name_to_id, encoder_layer_num = assign_encoder_layer_ids(
-        encoder_names=encoder_names,
-    )
+        encoder_name_to_id, encoder_layer_num = assign_encoder_layer_ids(
+            encoder_names=encoder_names,
+        )
 
-    pre_encoder_name_to_id = assign_non_encoder_layer_ids(non_encoder_names=pre_encoder_names, layer_id=0)
+        pre_encoder_name_to_id = assign_non_encoder_layer_ids(non_encoder_names=pre_encoder_names, layer_id=0)
 
-    post_encoder_name_to_id = assign_non_encoder_layer_ids(
-        non_encoder_names=post_encoder_names, layer_id=encoder_layer_num + 1
-    )
+        post_encoder_name_to_id = assign_non_encoder_layer_ids(
+            non_encoder_names=post_encoder_names, layer_id=encoder_layer_num + 1
+        )
 
-    name_to_id = reverse_layer_ids(
-        encoder_name_to_id=encoder_name_to_id,
-        pre_enocder_name_to_id=pre_encoder_name_to_id,
-        post_enocder_name_to_id=post_encoder_name_to_id,
-    )
+        name_to_id = reverse_layer_ids(
+            encoder_name_to_id=encoder_name_to_id,
+            pre_enocder_name_to_id=pre_encoder_name_to_id,
+            post_enocder_name_to_id=post_encoder_name_to_id,
+        )
+    except Exception as e:
+        logger.debug(
+            f"When calling assign_layer_ids(), it catches exception: {e}. All the layers will use the same layer_id."
+        )
+        name_to_id = dict()
+        left_names = names
+
     return name_to_id, left_names
 
 
@@ -409,61 +450,16 @@ def get_column_features(
     return column_features, feature_masks
 
 
-def inject_ia3_to_linear_layer(
-    model: nn.Module,
-    filter: Optional[List[str]] = None,
-    module_filter: Optional[List[str]] = None,
-) -> nn.Module:
+def create_adaptation(efficient_finetune: str, layer: nn.Module, lora_r: int, lora_alpha: int, **kwargs):
     """
-    Injects trainable adapters that inihibit and amplify activations, called (IA)^3.
-    Used for efficient fine-tuning of large pre-trained models.
+    Creates a model adaptation module (IA3, LoRA, IA3_LoRA) given a linear layer.
 
     Parameters
     ----------
-    model
-        A PyTorch model.
-    filter
-        Apply (IA)^3 only to linear layers filtered by name.
-        If None, (IA)^3 is applied to all linear Layers in module.
-    module_filter
-        Apply (IA)^3 only to modules filtered by name (e.g. ".*EncDecAttention|.*DenseReluDense")
-        If None, (IA)^3 is considered for all modules
-
-    Returns
-    -------
-    Model with injected (IA)3 modules.
-    """
-    for m_name, module in dict(model.named_modules()).items():
-        if not module_filter or any(re.match(filter_module, m_name) for filter_module in module_filter):
-            for c_name, layer in dict(module.named_children()).items():
-                if not filter or any(re.match(filter_layer, c_name) for filter_layer in filter):
-                    assert isinstance(
-                        layer, nn.Linear
-                    ), f"(IA)3 can only be applied to torch.nn.Linear, but {layer} is {type(layer)}."
-                    lora_layer = IA3Linear(layer.in_features, layer.out_features)
-                    lora_layer.weight = layer.weight
-                    lora_layer.bias = layer.bias
-                    setattr(module, c_name, lora_layer)
-
-    return model  # return model to enable method chaining
-
-
-def inject_lora_to_linear_layer(
-    model: nn.Module,
-    lora_r: int,
-    lora_alpha: int,
-    filter: Optional[List[str]] = None,
-    module_filter: Optional[List[str]] = None,
-) -> nn.Module:
-    """
-    Injects trainable Low-Rank decomposition matrices (LoRA) into linear
-    layers of a PyTorch model. Used for efficient fine-tuning of large
-    pre-trained models.
-
-    Parameters
-    ----------
-    model
-        A PyTorch model.
+    efficient_finetune
+        Name of the adaptation module.
+    layer
+       The layer the adaptation module should be applied to.
     lora_r
         The rank r of the low-rank decomposition.
     lora_alpha
@@ -480,19 +476,87 @@ def inject_lora_to_linear_layer(
     -------
     Model with injected LoRA modules.
     """
+    if "ia3_lora" in efficient_finetune:
+        return IA3LoRALinear(
+            layer.in_features, layer.out_features, r=lora_r, lora_alpha=lora_alpha, merge_weights=False
+        )
+    elif "conv_lora" in efficient_finetune:
+        return ConvLoRALinear(
+            layer.in_features,
+            layer.out_features,
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            merge_weights=False,
+            conv_lora_expert_num=kwargs["conv_lora_expert_num"],
+        )
+    elif "ia3" in efficient_finetune:
+        return IA3Linear(layer.in_features, layer.out_features, merge_weights=False)
+    elif "lora" in efficient_finetune:
+        return LoRALinear(layer.in_features, layer.out_features, r=lora_r, lora_alpha=lora_alpha, merge_weights=False)
+    elif efficient_finetune is not None and efficient_finetune != "None":
+        raise NotImplementedError(
+            f"The efficient finetuning strategy '{efficient_finetune}'"
+            f" is not supported. We only support"
+            f" {', '.join(PEFT_ADDITIVE_STRATEGIES)}."
+        )
+
+
+def inject_adaptation_to_linear_layer(
+    model: nn.Module,
+    efficient_finetune: str,
+    lora_r: int = None,
+    lora_alpha: int = None,
+    filter: Optional[List[str]] = None,
+    module_filter: Optional[List[str]] = None,
+    extra_trainable_params: Optional[List[str]] = None,
+    **kwargs,
+) -> nn.Module:
+    """
+    Injects trainable adatio Low-Rank decomposition matrices (LoRA) into linear
+    layers of a PyTorch model. Used for efficient fine-tuning of large
+    pre-trained models.
+
+    Parameters
+    ----------
+    model
+        A PyTorch model.
+    efficient_finetune
+        Efficient finetuning method that should be applied.
+    lora_r
+        The rank r of the low-rank decomposition.
+    lora_alpha
+        The scaling factor. Can be set to same value as r in
+        most cases, as initialization is scaled already.
+    filter
+        Apply loRA only to linear layers filtered by name (e.g. "query.").
+        If None, loRA is applied to all linear Layers in module.
+    module_filter
+        Apply loRA only to modules filtered by name (e.g. ".*EncDecAttention|.*DenseReluDense")
+        If None, loRA is considered for all modules
+    extra_trainable_params
+        Not to apply loRA to modules filtered by name, and these modules are not frozen during training (e.g. "mask_decoder").
+        If None, all the modules except for those applied loRA are frozen.
+    Returns
+    -------
+    Model with injected LoRA modules.
+    """
     for m_name, module in dict(model.named_modules()).items():
+        if extra_trainable_params and any(re.match(filter_layer, m_name) for filter_layer in extra_trainable_params):
+            continue
+        if hasattr(model, "frozen_layers") and any(
+            re.search(filter_layer, m_name) for filter_layer in model.frozen_layers
+        ):
+            continue
         if not module_filter or any(re.match(filter_module, m_name) for filter_module in module_filter):
             for c_name, layer in dict(module.named_children()).items():
                 if not filter or any(re.match(filter_layer, c_name) for filter_layer in filter):
                     assert isinstance(
                         layer, nn.Linear
                     ), f"LoRA can only be applied to torch.nn.Linear, but {layer} is {type(layer)}."
-                    lora_layer = LoRALinear(
-                        layer.in_features, layer.out_features, r=lora_r, lora_alpha=lora_alpha, merge_weights=False
-                    )
-                    lora_layer.weight = layer.weight
-                    lora_layer.bias = layer.bias
-                    setattr(module, c_name, lora_layer)
+                    adaptation_layer = create_adaptation(efficient_finetune, layer, lora_r, lora_alpha, **kwargs)
+                    adaptation_layer.weight = layer.weight
+                    adaptation_layer.bias = layer.bias
+                    setattr(module, c_name, adaptation_layer)
 
     return model  # return model to enable method chaining
 
@@ -516,22 +580,28 @@ def get_model_head(model: nn.Module):
         head = model.last_linear
     elif hasattr(model, "fc"):
         head = model.fc
+    elif hasattr(model, "classifier"):
+        head = model.classifier
     else:
         raise ValueError(f"Model {type(model)} doesn't have head. Need to check its implementation.")
 
-    return head
+    return head.fc if hasattr(head, "fc") else head
 
 
-def get_hf_config_and_model(checkpoint_name: str, pretrained: Optional[bool] = True):
+def get_hf_config_and_model(
+    checkpoint_name: str, pretrained: Optional[bool] = True, low_cpu_mem_usage: Optional[bool] = False
+):
     """
     Get a Huggingface config and model based on a checkpoint name.
 
     Parameters
     ----------
     checkpoint_name
-        A model checkpoint name.
+        A model checkpoint name or a local path that saves a custom checkpoint.
     pretrained
          Whether using the pretrained weights. If pretrained=True, download the pretrained model.
+    low_cpu_mem_usage
+        Whether to turn on the optimization of reducing the peak CPU memory usage when loading the pretrained model.
 
     Returns
     -------
@@ -540,7 +610,7 @@ def get_hf_config_and_model(checkpoint_name: str, pretrained: Optional[bool] = T
     config = AutoConfig.from_pretrained(checkpoint_name)
 
     if pretrained:
-        model = AutoModel.from_pretrained(checkpoint_name)
+        model = AutoModel.from_pretrained(checkpoint_name, low_cpu_mem_usage=low_cpu_mem_usage)
     else:
         model = AutoModel.from_config(config)
 
@@ -565,6 +635,57 @@ def apply_sigmoid(output: Dict):
     return output
 
 
+def apply_multi_class_semantic_seg_postprocess(output: Dict):
+    """
+    Apply the semantic postprocessing to logits.
+
+    Parameters
+    ----------
+    output
+        The model output dict.
+
+    Returns
+    -------
+    The output with post-proceesed semantic masks.
+    """
+
+    def semantic_inference(mask_cls, mask_pred):
+        """
+        Post-processing mask prediction for multi-class semantic segmentation inference based on https://github.com/facebookresearch/Mask2Former/blob/main/mask2former/maskformer_model.py
+
+        Args:
+            mask_cls (`torch.Tensor`):
+                Class logits. A tensor of shape `(num_queries, num_classes + 1)` (include the "no object" category).
+
+            mask_pred (`torch.Tensor`):
+                Mask logits. A tensor of shape `(num_queries, height, width)`.
+
+        Returns:
+            semseg (`torch.Tensor`): The processed mask prediction. A tensor of shape `(num_classes, height, width)`.
+
+        References:
+        [1] https://arxiv.org/abs/2107.06278
+        [2] https://arxiv.org/abs/2112.01527
+        """
+        mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1]
+        mask_pred = mask_pred.sigmoid()
+        semseg = torch.einsum("qc,qhw->chw", mask_cls, mask_pred)
+        return semseg
+
+    for k, v in output.items():
+        pred_classes = output[k][CLASS_LOGITS]
+        pred_masks = output[k][LOGITS]
+        semantic_masks = []
+        for mask_cls_result, mask_pred_result in zip(
+            pred_classes, pred_masks
+        ):  # bs, num_q, num_class and bs, num_q, h, w
+            per_sample_semantic_masks = semantic_inference(mask_cls_result, mask_pred_result)  # num_class, h, w
+            semantic_masks.append(per_sample_semantic_masks)
+        semantic_masks = torch.stack(semantic_masks, dim=0)
+        output[k][SEMANTIC_MASK] = semantic_masks
+    return output
+
+
 def get_model_postprocess_fn(problem_type: str, loss_func: _Loss):
     """
     Get the postprocessing function for the model outputs.
@@ -584,6 +705,11 @@ def get_model_postprocess_fn(problem_type: str, loss_func: _Loss):
     if problem_type == REGRESSION:
         if isinstance(loss_func, nn.BCEWithLogitsLoss):
             postprocess_func = apply_sigmoid
+    elif problem_type == SEMANTIC_SEGMENTATION:
+        if isinstance(loss_func, Mask2FormerLoss):
+            postprocess_func = apply_multi_class_semantic_seg_postprocess
+        else:
+            postprocess_func = apply_sigmoid
 
     return postprocess_func
 
@@ -601,11 +727,9 @@ def get_mmocr_config_and_model(checkpoint_name: str):
     -------
     An MMOCR config and model.
     """
-    try:
-        import mmcv
-        from mmcv.runner import load_checkpoint
-    except ImportError:
-        mmcv = None
+    from ..utils import check_if_packages_installed
+
+    check_if_packages_installed(package_names=["mmcv"])
     try:
         import mmocr
         from mmocr.models import build_detector
@@ -616,16 +740,166 @@ def get_mmocr_config_and_model(checkpoint_name: str):
     checkpoints = download(package="mmocr", configs=[checkpoint_name], dest_root=".")
 
     # read config files
-    assert mmcv is not None, "Please install mmcv-full by: mim install mmcv-full."
+    check_if_packages_installed(problem_type=OCR)
     config_file = checkpoint_name + ".py"
     if isinstance(config_file, str):
         config = mmcv.Config.fromfile(config_file)
 
     # build model and load pretrained weights
-    assert mmocr is not None, "Please install MMOCR by: pip install mmocr."
-
     checkpoint = checkpoints[0]
     model = build_detector(config.model, test_cfg=config.get("test_cfg"))
     if checkpoint is not None:
         checkpoint = load_checkpoint(model, checkpoint, map_location="cpu")
     return config, model
+
+
+def lookup_mmdet_config(key, config):
+    if key in config:
+        return config[key]
+    for subconfig in config.values():
+        if isinstance(subconfig, dict):
+            result = lookup_mmdet_config(key, subconfig)
+            if result is not None:
+                return result
+        elif isinstance(subconfig, list):
+            for subsubconfig in subconfig:
+                if isinstance(subsubconfig, dict):
+                    result = lookup_mmdet_config(key, subsubconfig)
+                    if result is not None:
+                        return result
+    return None
+
+
+def update_mmdet_config(key, value, config):
+    for k, subconfig in config.items():
+        if key == k:
+            config[k] = value
+        elif isinstance(subconfig, dict):
+            update_mmdet_config(key, value, subconfig)
+        elif isinstance(subconfig, list):
+            for subsubconfig in subconfig:
+                if isinstance(subsubconfig, dict):
+                    update_mmdet_config(key, value, subsubconfig)
+
+
+def run_model(model: nn.Module, batch: dict, trt_model: Optional[nn.Module] = None):
+    from ..utils.onnx import OnnxModule
+    from .document_transformer import DocumentTransformer
+    from .fusion.fusion_mlp import MultimodalFusionMLP
+    from .huggingface_text import HFAutoModelForTextPrediction
+    from .t_few import TFewModel
+    from .timm_image import TimmAutoModelForImagePrediction
+
+    supported_models = (
+        TimmAutoModelForImagePrediction,
+        HFAutoModelForTextPrediction,
+        MultimodalFusionMLP,
+        TFewModel,
+        OnnxModule,
+    )
+    pure_model = model
+    if isinstance(model, torch._dynamo.eval_frame.OptimizedModule):
+        pure_model = model._orig_mod
+    if isinstance(model, nn.DataParallel):
+        pure_model = model.module
+    if isinstance(pure_model, OnnxModule):
+        for k in batch:
+            # HACK input data types in ONNX
+            if batch[k].dtype == torch.int32:
+                batch[k] = batch[k].to(torch.int64)
+    if (not isinstance(pure_model, DocumentTransformer)) and isinstance(pure_model, supported_models):
+        input_vec = [batch[k] for k in pure_model.input_keys]
+        column_names, column_values = [], []
+        for k in batch.keys():
+            has_image_column_prefix = isinstance(pure_model, TimmAutoModelForImagePrediction) and k.startswith(
+                pure_model.image_column_prefix
+            )
+            has_text_column_prefix = isinstance(pure_model, HFAutoModelForTextPrediction) and k.startswith(
+                pure_model.text_column_prefix
+            )
+            if has_image_column_prefix or has_text_column_prefix:
+                column_names.append(k)
+                column_values.append(batch[k])
+        if column_names != [] and column_values != []:
+            input_vec.append(column_names)
+            input_vec.append(column_values)
+        if isinstance(pure_model, OnnxModule):
+            # OnnxModule doesn't support multi-gpu yet
+            output_vec = pure_model(*tuple(input_vec))
+        else:
+            output_vec = model(*tuple(input_vec))
+
+        output = pure_model.get_output_dict(*output_vec)
+    else:
+        output = model(batch)
+    return output
+
+
+def freeze_model_layers(model, frozen_layers):
+    """
+    Freeze model layers with pattern in frozen_layers.
+
+    Parameters
+    ----------
+    model
+        The pytorch model.
+    frozen_layers
+        A list of substrings of frozen layers' names.
+
+        e.g. if frozen_layers = ["backbone", "neck"],
+            all layers including "backbone" or "neck" in the name will be frozen.
+    """
+
+    if not frozen_layers:
+        return
+
+    is_frozen_layer = lambda n: any(bb in n for bb in frozen_layers)
+
+    for n, p in model.named_parameters():
+        if is_frozen_layer(n):
+            p.requires_grad = False
+
+
+def get_pretrained_tokenizer(
+    tokenizer_name: str,
+    checkpoint_name: str,
+    use_fast: Optional[bool] = True,
+    add_prefix_space: Optional[bool] = None,
+):
+    """
+    Load the tokenizer for a pre-trained huggingface checkpoint.
+
+    Parameters
+    ----------
+    tokenizer_name
+        The tokenizer type, e.g., "bert", "clip", "electra", and "hf_auto".
+    checkpoint_name
+        Name of a pre-trained checkpoint.
+    use_fast
+        Use a fast Rust-based tokenizer if it is supported for a given model.
+        If a fast tokenizer is not available for a given model, a normal Python-based tokenizer is returned instead.
+        See: https://huggingface.co/docs/transformers/model_doc/auto#transformers.AutoTokenizer.from_pretrained.use_fast
+
+    Returns
+    -------
+    A tokenizer instance.
+    """
+    try:
+        tokenizer_class = ALL_TOKENIZERS[tokenizer_name]
+        if add_prefix_space is None:
+            return tokenizer_class.from_pretrained(checkpoint_name, use_fast=use_fast)
+        else:
+            return tokenizer_class.from_pretrained(
+                checkpoint_name, use_fast=use_fast, add_prefix_space=add_prefix_space
+            )
+    except TypeError as e:
+        try:
+            tokenizer = BertTokenizer.from_pretrained(checkpoint_name)
+            warnings.warn(
+                f"Current checkpoint {checkpoint_name} does not support AutoTokenizer. "
+                "Switch to BertTokenizer instead.",
+                UserWarning,
+            )
+            return tokenizer
+        except:
+            raise e

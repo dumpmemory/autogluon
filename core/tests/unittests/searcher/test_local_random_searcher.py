@@ -1,23 +1,43 @@
-from autogluon.core.space import Categorical, Int, Real
+from math import isclose
+from numbers import Number
+
+from autogluon.common import space
 from autogluon.core.searcher import LocalRandomSearcher
+
+
+def dictsAlmostEqual(dict1, dict2, rel_tol=1e-8):
+    if len(dict1) != len(dict2):
+        return False
+    for key, item in dict1.items():
+        if isinstance(item, dict):
+            if not dictsAlmostEqual(dict1[key], dict2[key], rel_tol=rel_tol):
+                return False
+        else:
+            if isinstance(item, Number):
+                if not isclose(dict1[key], dict2[key], rel_tol=rel_tol):
+                    return False
+            else:
+                if not (dict1[key] == dict2[key]):
+                    return False
+    return True
 
 
 def test_local_random_searcher():
     search_space = dict(
-        a=Real(0, 1, default=0.2),
-        b=Real(0.05, 1, default=0.4, log=True),
-        c=Int(5, 15),
-        d=Int(7, 23, default=16),
-        e=Categorical('a', 7, ['hello', 2]),
+        a=space.Real(0, 1, default=0.2),
+        b=space.Real(0.05, 1, default=0.4, log=True),
+        c=space.Int(5, 15),
+        d=space.Int(7, 23, default=16),
+        e=space.Categorical("a", 7, ["hello", 2]),
     )
 
     searcher = LocalRandomSearcher(search_space=search_space)
 
-    expected_config_1 = {'a': 0.2, 'b': 0.4, 'c': 5, 'd': 16, 'e': 'a'}
-    expected_config_2 = {'a': 0.5488135039273248, 'b': 0.4260424000595025, 'c': 8, 'd': 10, 'e': 7}
-    expected_config_3 = {'a': 0.6235636967859723, 'b': 0.15814742875130683, 'c': 12, 'd': 13, 'e': 'a'}
-    expected_config_4 = {'a': 0.9636627605010293, 'b': 0.1577026248478398, 'c': 11, 'd': 14, 'e': ['hello', 2]}
-    expected_config_5 = {'a': 0.5680445610939323, 'b': 0.800200824711684, 'c': 13, 'd': 16, 'e': 'a'}
+    expected_config_1 = {"a": 0.2, "b": 0.4, "c": 5, "d": 16, "e": "a"}
+    expected_config_2 = {"a": 0.5488135039273248, "b": 0.4260424000595025, "c": 8, "d": 10, "e": 7}
+    expected_config_3 = {"a": 0.6235636967859723, "b": 0.15814742875130683, "c": 12, "d": 13, "e": "a"}
+    expected_config_4 = {"a": 0.9636627605010293, "b": 0.1577026248478398, "c": 11, "d": 14, "e": ["hello", 2]}
+    expected_config_5 = {"a": 0.5680445610939323, "b": 0.800200824711684, "c": 13, "d": 16, "e": "a"}
 
     assert searcher.get_best_reward() == float("-inf")
     config1 = searcher.get_config()
@@ -44,10 +64,10 @@ def test_local_random_searcher():
 
     config5 = searcher.get_config()
 
-    assert expected_config_1 == config1
-    assert expected_config_2 == config2
-    assert expected_config_3 == config3
-    assert expected_config_4 == config4
-    assert expected_config_5 == config5
+    assert dictsAlmostEqual(expected_config_1, config1)
+    assert dictsAlmostEqual(expected_config_2, config2)
+    assert dictsAlmostEqual(expected_config_3, config3)
+    assert dictsAlmostEqual(expected_config_4, config4)
+    assert dictsAlmostEqual(expected_config_5, config5)
 
     assert len(searcher._results) == 5

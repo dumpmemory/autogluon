@@ -13,7 +13,7 @@ set -ex
 source $(dirname "$0")/env_setup.sh
 source $(dirname "$0")/write_to_s3.sh
 
-if [[ (-n $PR_NUMBER) || ($GIT_REPO != awslabs/autogluon) ]]
+if [[ (-n $PR_NUMBER) || ($GIT_REPO != autogluon/autogluon) ]]
 then
     bucket='autogluon-staging'
     if [[ -n $PR_NUMBER ]]; then path=$PR_NUMBER; else path=$BRANCH; fi
@@ -53,32 +53,26 @@ else
     S3_PATH=s3://$BUCKET/build_docs/$BRANCH/$COMMIT_SHA/all  # We still write to BRANCH so copy_docs.sh knows where to find it
 fi
 
-mkdir -p docs/_build/rst/tutorials/
-aws s3 cp $BUILD_DOCS_PATH docs/_build/rst/tutorials/ --recursive
-
 setup_build_contrib_env
-install_all
-setup_mxnet_gpu
-# setup_torch
+install_all_no_tests
 
-sed -i -e "s@###_PLACEHOLDER_WEB_CONTENT_ROOT_###@http://$site@g" docs/config.ini
-sed -i -e "s@###_OTHER_VERSIONS_DOCUMENTATION_LABEL_###@$other_doc_version_text@g" docs/config.ini
-sed -i -e "s@###_OTHER_VERSIONS_DOCUMENTATION_BRANCH_###@$other_doc_version_branch@g" docs/config.ini
+LOCAL_DOC_PATH=_build/html
 
-shopt -s extglob
-rm -rf ./docs/tutorials/!(index.rst)
-cd docs && d2lbook build rst && d2lbook build html && cp static/images/* _build/html/_static
+cd docs
+rm -rf tutorials/eda  # disable eda temporarily
+sphinx-build -D nb_execution_mode=off -b html . $LOCAL_DOC_PATH
+
+rm -rf "$LOCAL_DOC_PATH/.doctrees/" # remove build artifacts that are not needed to serve webpage
+
+# Overwrite un-executed tutorials w/ executed versions (with images) from other build jobs
+aws s3 cp $BUILD_DOCS_PATH/tutorials/ $LOCAL_DOC_PATH/tutorials/ --recursive --exclude "*/index.html"
+aws s3 cp $BUILD_DOCS_PATH/_images/ $LOCAL_DOC_PATH/_images/ --recursive
 
 COMMAND_EXIT_CODE=$?
 if [ $COMMAND_EXIT_CODE -ne 0 ]; then
     exit COMMAND_EXIT_CODE
 fi
 
-DOC_PATH=_build/html/
 # Write docs to s3
-write_to_s3 $BUCKET $DOC_PATH $S3_PATH
-# Write root_index to s3 if master
-if [[ ($BRANCH == 'master') && ($GIT_REPO == awslabs/autogluon) ]]
-then
-    write_to_s3 $BUCKET root_index.html s3://$BUCKET/build_docs/$BRANCH/$COMMIT_SHA/root_index.html
-fi
+write_to_s3 $BUCKET $LOCAL_DOC_PATH $S3_PATH
+
