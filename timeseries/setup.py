@@ -4,9 +4,7 @@ import importlib.util
 ###########################
 # This code block is a HACK (!), but is necessary to avoid code duplication. Do NOT alter these lines.
 import os
-import warnings
 
-from packaging.version import parse as vparse
 from setuptools import setup
 
 filepath = os.path.abspath(os.path.dirname(__file__))
@@ -23,32 +21,49 @@ version = ag.update_version(version)
 submodule = "timeseries"
 install_requires = [
     # version ranges added in ag.get_dependency_version_ranges()
-    "joblib~=1.1",
-    "numpy",
-    "scipy",
-    "pandas",
-    "psutil>=5.7.3,<5.9",
-    "statsmodels~=0.13.0",
-    "gluonts~=0.11.0",
-    "torch>=1.9,<1.13",
-    "pytorch-lightning>=1.7.4,<1.8.0",
-    "networkx",
-    "tqdm",
-    f"autogluon.core=={version}",
+    "joblib>=1.1,<2",
+    "numpy",  # version range defined in `core/_setup_utils.py`
+    "scipy",  # version range defined in `core/_setup_utils.py`
+    "pandas",  # version range defined in `core/_setup_utils.py`
+    "torch",  # version range defined in `core/_setup_utils.py`
+    "lightning",  # version range defined in `core/_setup_utils.py`
+    "pytorch_lightning",  # version range defined in `core/_setup_utils.py`
+    "transformers[sentencepiece]",  # version range defined in `core/_setup_utils.py`
+    "accelerate",  # version range defined in `core/_setup_utils.py`
+    "gluonts>=0.15.0,<0.17",
+    "networkx",  # version range defined in `core/_setup_utils.py`
+    "statsforecast>=1.7.0,<2.0.1",
+    "mlforecast>0.13,<0.14",
+    "utilsforecast>=0.2.3,<0.2.11",  # to prevent breaking changes that propagate through mlforecast's dependency
+    "coreforecast>=0.0.12,<0.0.16",  # to prevent breaking changes that propagate through mlforecast's dependency
+    "fugue>=0.9.0",  # prevent dependency clash with omegaconf
+    "tqdm",  # version range defined in `core/_setup_utils.py`
+    "orjson~=3.9",  # use faster JSON implementation in GluonTS
+    # TODO v1.1: use lightning[pytorch-extra] instead of explicitly installing tensorboard
+    "tensorboard>=2.9,<3",  # fixes https://github.com/autogluon/autogluon/issues/3612
+    f"autogluon.core[raytune]=={version}",
     f"autogluon.common=={version}",
-    f"autogluon.tabular=={version}",
+    f"autogluon.tabular[catboost,lightgbm,xgboost]=={version}",
 ]
 
 extras_require = {
-    "tests": ["pytest", "flake8~=4.0", "flaky~=3.7", "pytest-timeout~=2.1", "isort>=5.10", "black~=22.0,>=22.3"],
-    "sktime": ["sktime>=0.13.1,<0.14", "pmdarima~=1.8.2", "tbats~=1.1"],
+    "tests": [
+        "pytest",
+        "ruff>=0.0.285",
+        "flaky>=3.7,<4",
+        "pytest-timeout>=2.1,<3",
+    ],
+    "chronos-openvino": [  # for faster CPU inference in pretrained models with OpenVINO
+        "optimum-intel[openvino,nncf]>=1.15,<1.17",
+        "optimum[openvino,nncf]>=1.17,<1.19",
+    ],
+    "chronos-onnx": [  # for faster CPU inference in pretrained models with ONNX
+        "optimum[onnxruntime]>=1.17,<1.20",
+    ],
 }
 
-all_requires = []
-for extra_package in ["sktime"]:
-    all_requires += extras_require[extra_package]
-extras_require["all"] = list(set(all_requires))
-
+# chronos-openvino and chronos-onnx are deprecated, and will be removed in a future version
+extras_require["all"] = []
 install_requires = ag.get_dependency_version_ranges(install_requires)
 
 if __name__ == "__main__":

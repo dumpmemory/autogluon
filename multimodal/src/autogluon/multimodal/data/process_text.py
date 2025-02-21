@@ -6,78 +6,25 @@ from copy import deepcopy
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
-from nptyping import NDArray
+from numpy.typing import NDArray
 from omegaconf import DictConfig
 from torch import nn
-from transformers import AutoConfig, AutoTokenizer, BertTokenizer, CLIPTokenizer, ElectraTokenizer
 
-from ..constants import (
-    AUTOMM,
-    CHOICES_IDS,
-    COLUMN,
-    TEXT,
-    TEXT_SEGMENT_IDS,
-    TEXT_TOKEN_IDS,
-    TEXT_VALID_LENGTH,
-    TOKEN_WORD_MAPPING,
-    WORD_OFFSETS,
-)
-from .collator import Pad, Stack
+from ..constants import CHOICES_IDS, COLUMN, TEXT, TEXT_SEGMENT_IDS, TEXT_TOKEN_IDS, TEXT_VALID_LENGTH
+from .collator import PadCollator, StackCollator
 from .template_engine import TemplateEngine
 from .trivial_augmenter import TrivialAugment
-from .utils import extract_value_from_config, normalize_txt, register_encoding_decoding_error_handlers
+from .utils import (
+    extract_value_from_config,
+    get_text_token_max_len,
+    normalize_txt,
+    register_encoding_decoding_error_handlers,
+)
 
-logger = logging.getLogger(AUTOMM)
+logger = logging.getLogger(__name__)
 
 # Disable tokenizer parallelism
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-
-ALL_TOKENIZERS = {
-    "bert": BertTokenizer,
-    "clip": CLIPTokenizer,
-    "electra": ElectraTokenizer,
-    "hf_auto": AutoTokenizer,
-}
-
-
-def construct_text_augmenter(
-    augment_maxscale: float,
-    augment_types: List[str],
-) -> Optional[TrivialAugment]:
-    """
-    Build up a text augmentor from the provided list of augmentation types
-
-    Parameters
-    ----------
-    augment_maxscale:
-        maximum scale for text augmentation
-    augment_types
-        A list of text augment types.
-
-    Returns
-    -------
-    A trivial augment instance.
-    """
-    if augment_maxscale == 0.0 or augment_maxscale is None:
-        return None
-
-    if augment_types is None or len(augment_types) == 0:
-        return TrivialAugment(TEXT, max_strength=augment_maxscale)
-    else:
-        auglist = []
-        for aug_type in augment_types:
-
-            if "(" in aug_type:
-                trans_mode = aug_type[0 : aug_type.find("(")]
-                args = ast.literal_eval(aug_type[aug_type.find("(") :])
-            else:
-                trans_mode = aug_type
-                args = None
-
-            auglist.append((trans_mode, args))
-
-        return TrivialAugment(TEXT, augment_maxscale, auglist)
 
 
 class TextProcessor:
@@ -89,7 +36,6 @@ class TextProcessor:
     def __init__(
         self,
         model: nn.Module,
-        tokenizer_name: Optional[str] = "hf_auto",
         max_len: Optional[int] = None,
         insert_sep: Optional[bool] = True,
         text_segment_num: Optional[int] = 1,
@@ -104,12 +50,8 @@ class TextProcessor:
         """
         Parameters
         ----------
-        prefix
-            The prefix connecting a processor to its corresponding model.
-        checkpoint_name
-            Name of the pretrained huggingface checkpoint, e.g., "microsoft/deberta-v3-small"
-        tokenizer_name
-            Name of the huggingface tokenizer type (default "hf_auto").
+        model
+            The model for which this processor would be created.
         max_len
             The maximum length of text tokens.
         insert_sep
@@ -131,36 +73,26 @@ class TextProcessor:
         normalize_text
             Whether to normalize text to resolve encoding problems.
             Examples of normalized texts can be found at
-            https://github.com/awslabs/autogluon/tree/master/examples/automm/kaggle_feedback_prize#15-a-few-examples-of-normalized-texts
+            https://github.com/autogluon/autogluon/tree/master/examples/automm/kaggle_feedback_prize#15-a-few-examples-of-normalized-texts
         """
         self.prefix = model.prefix
-        self.tokenizer_name = tokenizer_name
         self.requires_column_info = requires_column_info
-        # Use the model's tokenizer if it exists.
-        if hasattr(model, "tokenizer"):
-            self.tokenizer = model.tokenizer
-        else:
-            self.tokenizer = self.get_pretrained_tokenizer(
-                tokenizer_name=tokenizer_name,
-                checkpoint_name=model.checkpoint_name,
-            )
+        self.tokenizer_name = model.tokenizer_name
+        # model should have a tokenizer
+        self.tokenizer = model.tokenizer
         if hasattr(self.tokenizer, "deprecation_warnings"):
             # Disable the warning "Token indices sequence length is longer than the specified maximum sequence..."
             # See https://github.com/huggingface/transformers/blob/6ac77534bfe97c00e0127bb4fc846ae0faf1c9c5/src/transformers/tokenization_utils_base.py#L3362
             self.tokenizer.deprecation_warnings["sequence-length-is-longer-than-the-specified-maximum"] = True
 
         self.cls_token_id, self.sep_token_id, self.eos_token_id = self.get_special_tokens(tokenizer=self.tokenizer)
-        if max_len is None or max_len <= 0:
-            self.max_len = self.tokenizer.model_max_length
-        else:
-            if max_len < self.tokenizer.model_max_length:
-                warnings.warn(
-                    f"provided max length: {max_len} "
-                    f"is smaller than {model.checkpoint_name}'s default: {self.tokenizer.model_max_length}"
-                )
-            self.max_len = min(max_len, self.tokenizer.model_max_length)
+        self.max_len = get_text_token_max_len(
+            provided_max_len=max_len,
+            config=model.config,
+            tokenizer=self.tokenizer,
+            checkpoint_name=model.checkpoint_name,
+        )
         logger.debug(f"text max length: {self.max_len}")
-
         self.insert_sep = insert_sep
         self.eos_only = self.cls_token_id == self.sep_token_id == self.eos_token_id
 
@@ -191,9 +123,12 @@ class TextProcessor:
         self.train_augment_types = train_augment_types
         self.text_detection_length = text_detection_length
         self.text_trivial_aug_maxscale = text_trivial_aug_maxscale
-        self.train_augmenter = construct_text_augmenter(self.text_trivial_aug_maxscale, self.train_augment_types)
+        self.train_augmenter = self.construct_text_augmenter(self.text_trivial_aug_maxscale, self.train_augment_types)
         self.template_config = template_config
-        self.template_engine = TemplateEngine(self.template_config)
+        if self.template_config.turn_on:
+            self.template_engine = TemplateEngine(self.template_config)
+        else:
+            self.template_engine = None
 
         if self.normalize_text:
             register_encoding_decoding_error_handlers()
@@ -231,14 +166,14 @@ class TextProcessor:
         if self.requires_column_info:
             assert text_column_names, "Empty text column names."
             for col_name in text_column_names:
-                fn[f"{self.text_column_prefix}_{col_name}"] = Stack()
+                fn[f"{self.text_column_prefix}_{col_name}"] = StackCollator()
 
         fn.update(
             {
-                self.text_token_ids_key: Pad(pad_val=self.tokenizer.pad_token_id),
-                self.text_valid_length_key: Stack(),
-                self.text_segment_ids_key: Pad(pad_val=0),
-                self.choices_ids_key: Pad(pad_val=0),
+                self.text_token_ids_key: PadCollator(pad_val=self.tokenizer.pad_token_id),
+                self.text_valid_length_key: StackCollator(),
+                self.text_segment_ids_key: PadCollator(pad_val=0),
+                self.choices_ids_key: PadCollator(pad_val=0),
             }
         )
 
@@ -246,7 +181,7 @@ class TextProcessor:
 
     def build_one_token_sequence(
         self,
-        text_tokens: Dict[str, NDArray[(Any,), np.int32]],
+        text_tokens: Dict[str, NDArray],
     ) -> Dict:
         """
         Construct one token sequence based on multiple token sequences coming from different
@@ -367,11 +302,15 @@ class TextProcessor:
                     # naive way to detect categorical/numerical text:
                     if len(col_text.split(" ")) >= self.text_detection_length:
                         col_text = self.train_augmenter(col_text)
+                        # After text augmentation, "col_text" may become a list. An error will be raised when calling "tokenizer.encode".
+                        if type(col_text) == list and len(col_text) == 1:
+                            col_text = col_text[0]
+
             if col_name == CHOICES_IDS:
                 answer_ids = self.tokenizer(
                     col_text,
                     padding="max_length",
-                    max_length=20,  # TODO: Currently hardcoded max_length for textual choices.
+                    max_length=self.template_engine.get_max_choice_length(self.tokenizer),
                 )["input_ids"]
                 tokens[col_name] = answer_ids
                 continue
@@ -415,33 +354,11 @@ class TextProcessor:
         return cls_id, sep_id, eos_id
 
     @staticmethod
-    def get_pretrained_tokenizer(
-        tokenizer_name: str,
-        checkpoint_name: str,
-    ):
-        """
-        Load the tokenizer for a pre-trained huggingface checkpoint.
-
-        Parameters
-        ----------
-        tokenizer_name
-            The tokenizer type, e.g., "bert", "clip", "electra", and "hf_auto".
-        checkpoint_name
-            Name of a pre-trained checkpoint.
-
-        Returns
-        -------
-        A tokenizer instance.
-        """
-        tokenizer_class = ALL_TOKENIZERS[tokenizer_name]
-        return tokenizer_class.from_pretrained(checkpoint_name)
-
-    @staticmethod
     def get_trimmed_lengths(
         lengths: List[int],
         max_length: int,
         do_merge: bool = False,
-    ) -> np.ndarray:
+    ) -> List:
         """
         Get the trimmed lengths of multiple text token sequences. It will make sure that
         the trimmed length is smaller than or equal to the max_length.
@@ -472,7 +389,7 @@ class TextProcessor:
         if do_merge:
             total_length = sum(lengths)
             if total_length <= max_length:
-                return lengths
+                return list(lengths)
             trimmed_lengths = np.zeros_like(lengths)
             while sum(trimmed_lengths) != max_length:
                 remainder = max_length - sum(trimmed_lengths)
@@ -485,9 +402,47 @@ class TextProcessor:
                 else:
                     increment = min(min(nonzero_budgets), remainder // len(nonzero_idx))
                     trimmed_lengths[nonzero_idx] += increment
-            return trimmed_lengths
+            return list(trimmed_lengths)
         else:
-            return np.minimum(lengths, max_length)
+            return list(np.minimum(lengths, max_length))
+
+    @staticmethod
+    def construct_text_augmenter(
+        augment_maxscale: float,
+        augment_types: List[str],
+    ) -> Optional[TrivialAugment]:
+        """
+        Build up a text augmentor from the provided list of augmentation types
+
+        Parameters
+        ----------
+        augment_maxscale:
+            maximum scale for text augmentation
+        augment_types
+            A list of text augment types.
+
+        Returns
+        -------
+        A trivial augment instance.
+        """
+        if augment_maxscale == 0.0 or augment_maxscale is None:
+            return None
+
+        if augment_types is None or len(augment_types) == 0:
+            return TrivialAugment(TEXT, max_strength=augment_maxscale)
+        else:
+            auglist = []
+            for aug_type in augment_types:
+                if "(" in aug_type:
+                    trans_mode = aug_type[0 : aug_type.find("(")]
+                    args = ast.literal_eval(aug_type[aug_type.find("(") :])
+                else:
+                    trans_mode = aug_type
+                    args = None
+
+                auglist.append((trans_mode, args))
+
+            return TrivialAugment(TEXT, augment_maxscale, auglist)
 
     def __call__(
         self,
@@ -525,7 +480,9 @@ class TextProcessor:
             if k != "train_augmenter":
                 setattr(result, k, deepcopy(v, memo))
         # manual reconstruct augmenter
-        result.train_augmenter = construct_text_augmenter(result.text_trivial_aug_maxscale, result.train_augment_types)
+        result.train_augmenter = self.construct_text_augmenter(
+            result.text_trivial_aug_maxscale, result.train_augment_types
+        )
         return result
 
     def __getstate__(self):
@@ -535,6 +492,6 @@ class TextProcessor:
 
     def __setstate__(self, state):
         self.__dict__ = state
-        self.train_augmenter = construct_text_augmenter(
+        self.train_augmenter = self.construct_text_augmenter(
             state["text_trivial_aug_maxscale"], state["train_augment_types"]
         )

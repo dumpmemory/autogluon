@@ -1,26 +1,30 @@
 import logging
 from typing import Callable, Dict, List, Optional, Union
 
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import torch
 import torch.nn.functional as F
 import torchmetrics
+from lightning.pytorch.strategies import DeepSpeedStrategy
+from lightning.pytorch.utilities import grad_norm
 from torch import nn
 from torch.nn.modules.loss import _Loss
 from torchmetrics.aggregation import BaseAggregator
 
-from ..constants import AUTOMM, LM_TARGET, LOGITS, T_FEW, TEMPLATE_LOGITS, WEIGHT
+from ..constants import LM_TARGET, LOGITS, T_FEW, TEMPLATE_LOGITS, WEIGHT
 from ..data.mixup import MixupModule, multimodel_mixup
+from ..models.utils import run_model
+from .semantic_seg_metrics import COD, Balanced_Error_Rate
 from .utils import apply_layerwise_lr_decay, apply_single_lr, apply_two_stages_lr, get_lr_scheduler, get_optimizer
 
-logger = logging.getLogger(AUTOMM)
+logger = logging.getLogger(__name__)
 
 
 class LitModule(pl.LightningModule):
     """
     Control the loops for training, evaluation, and prediction. This module is independent of
     the model definition. This class inherits from the Pytorch Lightning's LightningModule:
-    https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html
+    https://lightning.ai/docs/pytorch/stable/common/lightning_module.html
     """
 
     def __init__(
@@ -45,6 +49,8 @@ class LitModule(pl.LightningModule):
         mixup_fn: Optional[MixupModule] = None,
         mixup_off_epoch: Optional[int] = 0,
         model_postprocess_fn: Callable = None,
+        skip_final_val: Optional[bool] = False,
+        track_grad_norm: Optional[Union[int, str]] = -1,
     ):
         """
         Parameters
@@ -107,11 +113,22 @@ class LitModule(pl.LightningModule):
             - lora, lora_bias, lora_norm (only finetunes decomposition matrices inserted into model, in combination with either bit_fit or norm_fit)
             - ia3, ia3_bias, ia3_norm (adds vector that scales activations by learned vectors, in combination with either bit_fit or norm_fit)
             - None (do not use efficient finetuning strategies)
+        track_grad_norm
+            Track the p-norm of gradients during training. May be set to ‘inf’ infinity-norm.
+            If using Automatic Mixed Precision (AMP), the gradients will be unscaled before logging them.
 
         """
         super().__init__()
         self.save_hyperparameters(
-            ignore=["model", "validation_metric", "test_metric", "loss_func", "model_postprocess_fn"]
+            ignore=[
+                "model",
+                "validation_metric",
+                "test_metric",
+                "loss_func",
+                "model_postprocess_fn",
+                "mixup_fn",
+                "trainable_param_names",
+            ]
         )
         self.model = model
         self.validation_metric = validation_metric
@@ -126,6 +143,8 @@ class LitModule(pl.LightningModule):
         self.custom_metric_func = custom_metric_func
         self.model_postprocess_fn = model_postprocess_fn
         self.trainable_param_names = trainable_param_names if trainable_param_names else []
+        self.skip_final_val = skip_final_val
+        self.track_grad_norm = track_grad_norm
 
     def _compute_template_loss(
         self,
@@ -136,12 +155,12 @@ class LitModule(pl.LightningModule):
         choices_scores = per_output[LOGITS]
         lm_target = per_output[LM_TARGET]
 
-        num_choices = self.model.num_classes
-        bs = int(lm_target.size(0) / num_choices)
+        bs = lm_target.size(0)
+        num_choices = lm_target.size(1)
 
         lm_loss = F.cross_entropy(
-            logits.view(bs, num_choices, *logits.size()[1:])[range(bs), label].flatten(0, 1),
-            lm_target.view(bs, num_choices, -1)[range(bs), label].flatten(0, 1),
+            logits[range(bs), label].flatten(0, 1),
+            lm_target[range(bs), label].flatten(0, 1),
         )
         if self.model.mc_loss > 0:
             mc_loss = F.cross_entropy(choices_scores, label)
@@ -149,10 +168,10 @@ class LitModule(pl.LightningModule):
             mc_loss = 0.0
 
         if self.model.unlikely_loss > 0:
-            cand_loglikely = -F.cross_entropy(logits.flatten(0, 1), lm_target.flatten(0, 1), reduction="none").view(
+            cand_loglikely = -F.cross_entropy(logits.flatten(0, 2), lm_target.flatten(0, 2), reduction="none").view(
                 bs, num_choices, -1
             )
-            cand_loglikely += (lm_target < 0).view(bs, num_choices, -1) * -100
+            cand_loglikely += (lm_target < 0) * -100
             cand_loglikely[range(bs), label] = -100
             unlikely_loss = -torch.log(1 - torch.exp(cand_loglikely) + 1e-2).sum() / (cand_loglikely != -100).sum()
         else:
@@ -189,13 +208,20 @@ class LitModule(pl.LightningModule):
         logits: torch.Tensor,
         label: torch.Tensor,
     ):
-        if isinstance(metric, (torchmetrics.AUROC, torchmetrics.AveragePrecision)):
+        if isinstance(
+            metric,
+            (
+                torchmetrics.classification.BinaryAUROC,
+                torchmetrics.classification.BinaryAveragePrecision,
+                torchmetrics.classification.BinaryF1Score,
+            ),
+        ):
             prob = F.softmax(logits.float(), dim=1)
             metric.update(preds=prob[:, 1], target=label)  # only for binary classification
         elif isinstance(metric, BaseAggregator):
             metric.update(custom_metric_func(logits, label))
         else:
-            metric.update(logits.squeeze(dim=1), label)
+            metric.update(logits.squeeze(dim=1).float(), label)
 
     def _shared_step(
         self,
@@ -205,14 +231,14 @@ class LitModule(pl.LightningModule):
         if self.mixup_fn is not None:
             self.mixup_fn.mixup_enabled = self.training & (self.current_epoch < self.hparams.mixup_off_epoch)
             batch, label = multimodel_mixup(batch=batch, model=self.model, mixup_fn=self.mixup_fn)
-        output = self.model(batch)
+        output = run_model(self.model, batch)
         loss = self._compute_loss(output=output, label=label)
         return output, loss
 
     def training_step(self, batch, batch_idx):
         """
-        Per training step. This function is registered by pl.LightningModule.
-        Refer to https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html#training-loop
+        Per training step. This function is registered by LightningModule.
+        Refer to https://lightning.ai/docs/pytorch/stable/common/lightning_module.html#training-loop
 
         Parameters
         ----------
@@ -232,10 +258,22 @@ class LitModule(pl.LightningModule):
         self.log("train_loss", loss)
         return loss
 
+    def on_validation_start(self) -> None:
+        if self.skip_final_val and self.trainer.should_stop:
+            self.log(
+                self.validation_metric_name,
+                self.validation_metric,
+                on_step=False,
+                on_epoch=True,
+            )
+            return None
+        else:
+            return super().on_validation_start()
+
     def validation_step(self, batch, batch_idx):
         """
-        Per validation step. This function is registered by pl.LightningModule.
-        Refer to https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html#validation
+        Per validation step. This function is registered by LightningModule.
+        Refer to https://lightning.ai/docs/pytorch/stable/common/lightning_module.html#validation-loop
 
         Parameters
         ----------
@@ -258,7 +296,7 @@ class LitModule(pl.LightningModule):
             custom_metric_func=self.custom_metric_func,
             logits=output[self.model.prefix][LOGITS],
             label=batch[self.model.label_key],
-        ),
+        )
         self.log(
             self.validation_metric_name,
             self.validation_metric,
@@ -268,8 +306,8 @@ class LitModule(pl.LightningModule):
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         """
-        Per prediction step. This function is registered by pl.LightningModule.
-        Refer to https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html#prediction-loop
+        Per prediction step. This function is registered by LightningModule.
+        Refer to https://lightning.ai/docs/pytorch/stable/common/lightning_module.html#prediction-loop
 
         Parameters
         ----------
@@ -286,7 +324,7 @@ class LitModule(pl.LightningModule):
         -------
         A dictionary with the mini-batch's logits and features.
         """
-        output = self.model(batch)
+        output = run_model(self.model, batch)
         if self.model_postprocess_fn:
             output = self.model_postprocess_fn(output)
 
@@ -294,8 +332,8 @@ class LitModule(pl.LightningModule):
 
     def configure_optimizers(self):
         """
-        Configure optimizer. This function is registered by pl.LightningModule.
-        Refer to https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html#configure-optimizers
+        Configure optimizer. This function is registered by LightningModule.
+        Refer to https://lightning.ai/docs/pytorch/stable/common/lightning_module.html#configure-optimizers
         Returns
         -------
         [optimizer]
@@ -326,6 +364,8 @@ class LitModule(pl.LightningModule):
         else:
             logger.debug("applying single learning rate...")
             grouped_parameters = apply_single_lr(
+                efficient_finetune=self.hparams.efficient_finetune,
+                trainable_param_names=self.trainable_param_names,
                 **kwargs,
             )
 
@@ -338,7 +378,7 @@ class LitModule(pl.LightningModule):
 
         logger.debug(f"trainer.max_steps: {self.trainer.max_steps}")
         if self.trainer.max_steps is None or -1:
-            if "deepspeed" in self.trainer.strategy.strategy_name:
+            if isinstance(self.trainer.strategy, DeepSpeedStrategy):
                 max_steps = 1
             else:
                 max_steps = (
@@ -373,3 +413,8 @@ class LitModule(pl.LightningModule):
         sched = {"scheduler": scheduler, "interval": "step"}
         logger.debug("done configuring optimizer and scheduler")
         return [optimizer], [sched]
+
+    def on_before_optimizer_step(self, optimizer):
+        # If using mixed precision, the gradients are already unscaled here
+        if self.track_grad_norm != -1:
+            self.log_dict(grad_norm(self, norm_type=self.track_grad_norm))

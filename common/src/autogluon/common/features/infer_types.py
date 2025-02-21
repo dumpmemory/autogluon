@@ -14,25 +14,27 @@ def get_type_family_raw(dtype) -> str:
     try:
         if isinstance(dtype, pd.SparseDtype):
             dtype = dtype.subtype
-        if dtype.name == 'category':
-            return 'category'
-        if 'datetime' in dtype.name:
-            return 'datetime'
-        if 'string' in dtype.name:
-            return 'object'
+        if dtype.name == "category":
+            return "category"
+        if "datetime" in dtype.name:
+            return "datetime"
+        if "string" in dtype.name:
+            return "object"
         elif np.issubdtype(dtype, np.integer):
-            return 'int'
+            return "int"
         elif np.issubdtype(dtype, np.floating):
-            return 'float'
+            return "float"
     except Exception as err:
-        logger.error(f'Warning: dtype {dtype} is not recognized as a valid dtype by numpy! '
-                     f'AutoGluon may incorrectly handle this feature...')
+        logger.error(
+            f"Warning: dtype {dtype} is not recognized as a valid dtype by numpy! "
+            f"AutoGluon may incorrectly handle this feature..."
+        )
         logger.error(err)
 
-    if dtype.name in ['bool', 'bool_']:
-        return 'bool'
-    elif dtype.name in ['str', 'string', 'object']:
-        return 'object'
+    if dtype.name in ["bool", "bool_"]:
+        return "bool"
+    elif dtype.name in ["str", "string", "object"]:
+        return "object"
     else:
         return dtype.name
 
@@ -61,11 +63,11 @@ def get_type_map_special(X: DataFrame) -> dict:
 def get_types_special(X: Series) -> List[str]:
     types_special = []
     if isinstance(X.dtype, pd.SparseDtype):
-        types_special.append('sparse')
+        types_special.append("sparse")
     if check_if_datetime_as_object_feature(X):
-        types_special.append('datetime_as_object')
+        types_special.append("datetime_as_object")
     elif check_if_nlp_feature(X):
-        types_special.append('text')
+        types_special.append("text")
     return types_special
 
 
@@ -104,7 +106,7 @@ def check_if_datetime_as_object_feature(X: Series) -> bool:
     # TODO: If low numeric, potentially it is just numeric instead of date
     if X.isnull().all():
         return False
-    if type_family != 'object':  # TODO: seconds from epoch support
+    if type_family != "object":  # TODO: seconds from epoch support
         return False
     try:
         # TODO: pd.Series(['20170204','20170205','20170206']) is incorrectly not detected as datetime_as_object
@@ -116,7 +118,7 @@ def check_if_datetime_as_object_feature(X: Series) -> bool:
             if len(X) > 500:
                 # Sample to speed-up type inference
                 X = X.sample(n=500, random_state=0)
-            result = pd.to_datetime(X, errors='coerce')
+            result = pd.to_datetime(X, errors="coerce", format="mixed")
             if result.isnull().mean() > 0.8:  # If over 80% of the rows are NaN
                 return False
             return True
@@ -128,7 +130,7 @@ def check_if_datetime_as_object_feature(X: Series) -> bool:
 
 def check_if_nlp_feature(X: Series) -> bool:
     type_family = get_type_family_raw(X.dtype)
-    if type_family != 'object':
+    if type_family != "object":
         return False
     if len(X) > 5000:
         # Sample to speed-up type inference
@@ -140,7 +142,7 @@ def check_if_nlp_feature(X: Series) -> bool:
     if unique_ratio <= 0.01:
         return False
     try:
-        avg_words = Series(X_unique).str.split().str.len().mean()
+        avg_words = Series(X_unique.astype(str)).str.split().str.len().mean()
     except AttributeError:
         return False
     if avg_words < 3:
@@ -149,9 +151,9 @@ def check_if_nlp_feature(X: Series) -> bool:
     return True
 
 
-def get_bool_true_val(series: pd.Series):
+def get_bool_true_val(uniques):
     """
-    From a pandas series, get the replace_val to convert to boolean when calling:
+    From a pandas series with `uniques = series.unique()`, get the replace_val to convert to boolean when calling:
     series_bool = series == replace_val
 
     Therefore, any value other than `replace_val` will be set to `False` when converting to boolean.
@@ -170,17 +172,19 @@ def get_bool_true_val(series: pd.Series):
     # This is a safety net in case the unique types are mixed (such as string and int). In this scenario, an exception is raised
     # and therefore we use the unsorted values.
     try:
-        uniques = series.unique()
         # Sort the values to avoid relying on row-order when determining which value is mapped to `True`.
         uniques.sort()
     except:
-        uniques = series.unique()
+        pass
     replace_val = uniques[1]
     try:
         # This is to ensure that we don't map np.nan to `True` in the boolean.
         is_nan = np.isnan(replace_val)
     except:
-        is_nan = False
+        if replace_val is None:
+            is_nan = True
+        else:
+            is_nan = False
     if is_nan:
         replace_val = uniques[0]
     return replace_val

@@ -2,10 +2,8 @@ from typing import Any, Dict, List, Optional, Union
 
 from torch import nn
 
-from ..constants import LABEL, MMDET_IMAGE, NER, NER_ANNOTATION, TEXT
-from .collator import List as ColList
-from .collator import Stack
-from .utils import process_ner_annotations
+from ..constants import LABEL, MMDET_IMAGE
+from .collator import ListCollator, StackCollator
 
 
 class LabelProcessor:
@@ -22,14 +20,10 @@ class LabelProcessor:
         """
         Parameters
         ----------
-        prefix
-            The prefix connecting a processor to its corresponding model.
+        model
+            The model for which this processor would be created.
         """
         self.prefix = model.prefix
-        self.tokenizer = None
-        self.model = model
-        if self.prefix == NER:
-            self.tokenizer = model.tokenizer
 
     @property
     def label_key(self):
@@ -45,9 +39,9 @@ class LabelProcessor:
         A dictionary containing one model's collator function for labels.
         """
         if self.prefix == MMDET_IMAGE:
-            fn = {self.label_key: ColList()}
+            fn = {self.label_key: ListCollator()}
         else:
-            fn = {self.label_key: Stack()}
+            fn = {self.label_key: StackCollator()}
         return fn
 
     def process_one_sample(
@@ -66,23 +60,17 @@ class LabelProcessor:
         -------
         A dictionary containing one sample's label.
         """
-        if self.prefix == NER:
-            ner_annotation = labels[NER_ANNOTATION]
-            ner_text = labels[TEXT]
-            # online label generation
-            return {
-                self.label_key: process_ner_annotations(ner_annotation, ner_text, self.tokenizer),
-            }
-        else:
-            return {
-                self.label_key: labels[next(iter(labels))],  # get the first key's value
-            }
+
+        return {
+            self.label_key: labels[next(iter(labels))],  # get the first key's value
+        }
 
     def __call__(
         self,
         labels: Dict[str, Union[int, float]],
         feature_modalities: Dict[str, Union[int, float, list]],
         is_training: bool,
+        load_only: bool = False,  # TODO: refactor mmdet_image and remove this
     ) -> Dict:
         """
         Extract one sample's labels and customize them for a specific model.
@@ -95,6 +83,8 @@ class LabelProcessor:
             The modality of the feature columns.
         is_training
             Whether to do processing in the training mode. This unused flag is for the API compatibility.
+        load_only
+            Whether to only load the data. Other processing steps may happen in dataset.__getitem__.
 
         Returns
         -------

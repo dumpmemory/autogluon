@@ -3,8 +3,8 @@ from typing import List, Optional
 from torch import nn
 
 from ..constants import FEATURES, LABEL, LOGITS, NUMERICAL
+from .ft_transformer import NumEmbeddings
 from .mlp import MLP
-from .numerical_transformer import NumEmbeddings
 from .utils import init_weights
 
 
@@ -91,6 +91,10 @@ class NumericalMLP(nn.Module):
     @property
     def numerical_key(self):
         return f"{self.prefix}_{NUMERICAL}"
+
+    @property
+    def input_keys(self):
+        return [self.numerical_key]
 
     @property
     def label_key(self):

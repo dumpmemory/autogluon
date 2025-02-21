@@ -1,27 +1,23 @@
 import logging
 from typing import Callable, Dict, List, Optional, Union
 
-import pytorch_lightning as pl
 import torch
-import torch.nn.functional as F
 import torchmetrics
 from torch import nn
 from torch.nn.modules.loss import _Loss
-from torchmetrics.aggregation import BaseAggregator
 
-from ..constants import AUTOMM, LM_TARGET, LOGITS, T_FEW, TEMPLATE_LOGITS, WEIGHT
-from ..data.mixup import MixupModule, multimodel_mixup
+from ..constants import FUSION_NER, LOGITS, NER_TEXT, WEIGHT
+from ..data.mixup import MixupModule
 from .lit_module import LitModule
-from .utils import apply_layerwise_lr_decay, apply_single_lr, apply_two_stages_lr, get_lr_scheduler, get_optimizer
 
-logger = logging.getLogger(AUTOMM)
+logger = logging.getLogger(__name__)
 
 
 class NerLitModule(LitModule):
     """
     Control the loops for training, evaluation, and prediction of Named Entity Recognition. This module is independent of
-    the model definition. This class inherits from the Pytorch Lightning's LightningModule:
-    https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html
+    the model definition. This class inherits from Lightning's LightningModule:
+    https://lightning.ai/docs/pytorch/stable/common/lightning_module.html
     """
 
     def __init__(
@@ -46,6 +42,8 @@ class NerLitModule(LitModule):
         mixup_fn: Optional[MixupModule] = None,
         mixup_off_epoch: Optional[int] = 0,
         model_postprocess_fn: Callable = None,
+        skip_final_val: Optional[bool] = False,
+        track_grad_norm: Optional[Union[int, str]] = -1,
     ):
         """
         Parameters
@@ -108,29 +106,34 @@ class NerLitModule(LitModule):
             - lora, lora_bias, lora_norm (only finetunes decomposition matrices inserted into model, in combination with either bit_fit or norm_fit)
             - ia3, ia3_bias, ia3_norm (adds vector that scales activations by learned vectors, in combination with either bit_fit or norm_fit)
             - None (do not use efficient finetuning strategies)
+        track_grad_norm
+            Track the p-norm of gradients during training. May be set to ‘inf’ infinity-norm.
+            If using Automatic Mixed Precision (AMP), the gradients will be unscaled before logging them.
 
         """
         super().__init__(
-            model,
-            optim_type,
-            lr_choice,
-            lr_schedule,
-            lr,
-            lr_decay,
-            end_lr,
-            lr_mult,
-            weight_decay,
-            warmup_steps,
-            loss_func,
-            validation_metric,
-            validation_metric_name,
-            custom_metric_func,
-            test_metric,
-            efficient_finetune,
-            trainable_param_names,
-            mixup_fn,
-            mixup_off_epoch,
-            model_postprocess_fn,
+            model=model,
+            optim_type=optim_type,
+            lr_choice=lr_choice,
+            lr_schedule=lr_schedule,
+            lr=lr,
+            lr_decay=lr_decay,
+            end_lr=end_lr,
+            lr_mult=lr_mult,
+            weight_decay=weight_decay,
+            warmup_steps=warmup_steps,
+            loss_func=loss_func,
+            validation_metric=validation_metric,
+            validation_metric_name=validation_metric_name,
+            custom_metric_func=custom_metric_func,
+            test_metric=test_metric,
+            efficient_finetune=efficient_finetune,
+            trainable_param_names=trainable_param_names,
+            mixup_fn=mixup_fn,
+            mixup_off_epoch=mixup_off_epoch,
+            model_postprocess_fn=model_postprocess_fn,
+            skip_final_val=skip_final_val,
+            track_grad_norm=track_grad_norm,
         )
 
     def _compute_loss(
@@ -139,24 +142,25 @@ class NerLitModule(LitModule):
         label: torch.Tensor,
     ):
         loss = 0
-        for _, per_output in output.items():
-            weight = per_output[WEIGHT] if WEIGHT in per_output else 1
-            active_loss = label.view(-1) != 0
-            active_logits = per_output[LOGITS].view(-1, self.model.num_classes)[active_loss]
-            active_labels = label.view(-1)[active_loss]
-            loss += (
-                self.loss_func(
-                    input=active_logits,
-                    target=active_labels,
+        for prefix, per_output in output.items():
+            if prefix == NER_TEXT or prefix == FUSION_NER:
+                weight = per_output[WEIGHT] if WEIGHT in per_output else 1
+                active_loss = label.view(-1) != 0
+                active_logits = per_output[LOGITS].view(-1, self.model.num_classes)[active_loss]
+                active_labels = label.view(-1)[active_loss]
+                loss += (
+                    self.loss_func(
+                        input=active_logits,
+                        target=active_labels,
+                    )
+                    * weight
                 )
-                * weight
-            )
         return loss
 
     def validation_step(self, batch, batch_idx):
         """
-        Per validation step. This function is registered by pl.LightningModule.
-        Refer to https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html#validation
+        Per validation step. This function is registered by LightningModule.
+        Refer to https://lightning.ai/docs/pytorch/stable/common/lightning_module.html#validation
 
         Parameters
         ----------
@@ -185,7 +189,7 @@ class NerLitModule(LitModule):
             custom_metric_func=self.custom_metric_func,
             logits=active_logits,
             label=active_labels,
-        ),
+        )
         self.log(
             self.validation_metric_name,
             self.validation_metric,

@@ -8,12 +8,13 @@ import pandas as pd
 import torch
 from omegaconf import DictConfig
 from torch import nn
+from torch.nn import functional as F
 
-from ..constants import AUTOMM, FUSION, QUERY, RESPONSE
+from ..constants import FUSION, QUERY, RESPONSE
 from .data import data_to_df
 from .model import create_model
 
-logger = logging.getLogger(AUTOMM)
+logger = logging.getLogger(__name__)
 
 
 def get_fusion_model_dict(
@@ -64,6 +65,7 @@ def get_fusion_model_dict(
 def create_fusion_model_dict(
     config: DictConfig,
     single_models: Optional[Dict] = None,
+    pretrained: Optional[bool] = True,
 ):
     """
     Create a dict of single models and fusion piece based on a late-fusion config.
@@ -100,6 +102,7 @@ def create_fusion_model_dict(
         model = create_model(
             model_name=model_name,
             model_config=model_config,
+            pretrained=pretrained,
         )
         if model_name.lower().startswith(FUSION):
             fusion_model = model
@@ -228,6 +231,7 @@ def create_siamese_model(
     response_config: DictConfig,
     query_model: Optional[nn.Module] = None,
     response_model: Optional[nn.Module] = None,
+    pretrained: Optional[bool] = True,
 ):
     """
     Create the query and response models and make them share the same encoders for the same modalities.
@@ -250,6 +254,7 @@ def create_siamese_model(
     if query_model is None:
         single_models, query_fusion_model = create_fusion_model_dict(
             config=query_config.model,
+            pretrained=pretrained,
         )
     else:
         single_models, query_fusion_model = get_fusion_model_dict(
@@ -260,6 +265,7 @@ def create_siamese_model(
         single_models, response_fusion_model = create_fusion_model_dict(
             config=response_config.model,
             single_models=single_models,
+            pretrained=pretrained,
         )
     else:
         single_models, response_fusion_model = get_fusion_model_dict(
@@ -332,10 +338,10 @@ def semantic_search(
     response_data: Optional[Union[pd.DataFrame, dict, list]] = None,
     query_embeddings: Optional[torch.Tensor] = None,
     response_embeddings: Optional[torch.Tensor] = None,
-    query_chunk_size: int = 100,
+    query_chunk_size: int = 128,
     response_chunk_size: int = 500000,
     top_k: int = 10,
-    id_mappings: Optional[Dict[str, Dict]] = None,
+    id_mappings: Optional[Union[Dict[str, Dict], Dict[str, pd.Series]]] = None,
     similarity_type: Optional[str] = "cosine",
 ):
     """
@@ -379,10 +385,10 @@ def semantic_search(
     ), "Both response_data and response_embeddings are None."
 
     if query_embeddings is None:
-        query_header = matcher._query[0] if matcher._query is not None else QUERY
+        query_header = matcher.query[0] if matcher.query is not None else QUERY
         query_data = data_to_df(query_data, header=query_header)
     if response_embeddings is None:
-        response_header = matcher._response[0] if matcher._response else RESPONSE
+        response_header = matcher.response[0] if matcher.response else RESPONSE
         response_data = data_to_df(response_data, header=response_header)
 
     if query_embeddings is None:
@@ -401,7 +407,6 @@ def semantic_search(
         if query_embeddings is None:
             batch_query_embeddings = matcher.extract_embedding(
                 query_data[query_start_idx : query_start_idx + query_chunk_size],
-                signature=QUERY,
                 id_mappings=id_mappings,
                 as_tensor=True,
             )
@@ -412,7 +417,6 @@ def semantic_search(
             if response_embeddings is None:
                 batch_response_embeddings = matcher.extract_embedding(
                     response_data[response_start_idx : response_start_idx + response_chunk_size],
-                    signature=RESPONSE,
                     id_mappings=id_mappings,
                     as_tensor=True,
                 )
@@ -453,7 +457,84 @@ def semantic_search(
     for query_id in range(len(queries_result_list)):
         for doc_itr in range(len(queries_result_list[query_id])):
             score, corpus_id = queries_result_list[query_id][doc_itr]
-            queries_result_list[query_id][doc_itr] = {"corpus_id": corpus_id, "score": score}
+            queries_result_list[query_id][doc_itr] = {"response_id": corpus_id, "score": score}
         queries_result_list[query_id] = sorted(queries_result_list[query_id], key=lambda x: x["score"], reverse=True)
 
     return queries_result_list
+
+
+def convert_data_for_ranking(
+    data: pd.DataFrame, query_column: str, response_column: str, label_column: Optional[str] = None
+):
+    """
+    Extract query and response data from a dataframe.
+    If no label column exists, append one label column with all 1 labels,
+    which assumes (a_i, p_i) are a positive pair and (a_i, p_j) for i!=j a negative pair.
+
+    Parameters
+    ----------
+    data
+        A dataframe with query, response, and label (optional) columns.
+    query_column
+        Name of the query column.
+    response_column
+        Name of the response column.
+    label_column
+        Name of the label column. If None, use `relevance` by default.
+
+    Returns
+    -------
+    data_with_label
+        A dataframe with query, response, and label columns.
+    query_data
+        The unique query data in the dataframe format.
+    response_data
+        The unique response data in the dataframe format.
+    label_column
+        Name of the label column.
+    """
+    data_with_label = data.copy()
+    if label_column is None:
+        data_with_label["relevance"] = [1] * len(data)
+        label_column = "relevance"
+
+    query_data = pd.DataFrame({query_column: data[query_column].unique().tolist()})
+    response_data = pd.DataFrame({response_column: data[response_column].unique().tolist()})
+
+    return data_with_label, query_data, response_data, label_column
+
+
+def compute_matching_probability(
+    logits: Optional[torch.Tensor] = None,
+    embeddings1: Optional[torch.Tensor] = None,
+    embeddings2: Optional[torch.Tensor] = None,
+    reverse_prob: Optional[bool] = False,
+):
+    """
+    Compute probabilities from logits or embedding pairs.
+
+    Parameters
+    ----------
+    logits
+        The output of a model's head layer.
+    embeddings1
+        Feature embeddings of one side in matching.
+    embeddings2
+        Feature embeddings 2 of the other side in matching.
+    reverse_prob
+        Whether to reverse the probability.
+
+    Returns
+    -------
+    Probabilities.
+    """
+    if logits is not None:
+        prob = F.softmax(logits.float(), dim=1)[:, 1]
+    else:
+        cosine_similarity = F.cosine_similarity(embeddings1, embeddings2)
+        prob = 0.5 * (cosine_similarity + 1)
+
+    if reverse_prob:
+        prob = 1 - prob
+
+    return prob

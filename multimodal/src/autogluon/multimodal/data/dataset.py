@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import pandas as pd
 import torch
@@ -8,7 +8,7 @@ from ..constants import AUTOMM, GET_ITEM_ERROR_RETRY
 from .preprocess_dataframe import MultiModalFeaturePreprocessor
 from .utils import apply_data_processor, apply_df_preprocessor, get_per_sample_features
 
-logger = logging.getLogger(AUTOMM)
+logger = logging.getLogger(__name__)
 
 
 class BaseDataset(torch.utils.data.Dataset):
@@ -24,7 +24,7 @@ class BaseDataset(torch.utils.data.Dataset):
         data: pd.DataFrame,
         preprocessor: List[MultiModalFeaturePreprocessor],
         processors: List[dict],
-        id_mappings: Optional[Dict[str, Dict]] = None,
+        id_mappings: Optional[Union[Dict[str, Dict], Dict[str, pd.Series]]] = None,
         is_training: bool = False,
     ):
         """

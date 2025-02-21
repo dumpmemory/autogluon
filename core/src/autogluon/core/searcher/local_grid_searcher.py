@@ -4,10 +4,11 @@ from typing import Dict
 import numpy as np
 from sklearn.model_selection import ParameterGrid
 
-from .local_searcher import LocalSearcher
-from ..space import Categorical, Space, Int, Real
+from autogluon.common import space as ag_space
 
-__all__ = ['LocalGridSearcher']
+from .local_searcher import LocalSearcher
+
+__all__ = ["LocalGridSearcher"]
 
 logger = logging.getLogger(__name__)
 
@@ -38,15 +39,15 @@ class LocalGridSearcher(LocalSearcher):
     def _get_params_space(self) -> dict:
         param_space = dict()
         for key, val in self.search_space.items():
-            if isinstance(val, Space):
+            if isinstance(val, ag_space.Space):
                 samples_num = self._get_samples_number(key)
-                if isinstance(val, Int):
+                if isinstance(val, ag_space.Int):
                     samples = min(val.upper - val.lower + 1, samples_num)
                     param_space[key] = np.linspace(val.lower, val.upper, samples, dtype=int)
-                elif isinstance(val, Real):
+                elif isinstance(val, ag_space.Real):
                     space = np.geomspace if val.log else np.linspace
                     param_space[key] = space(val.lower, val.upper, num=samples_num)
-                elif isinstance(val, Categorical):
+                elif isinstance(val, ag_space.Categorical):
                     sk = val.convert_to_sklearn()
                     param_space[key] = sk
                 else:
@@ -64,9 +65,9 @@ class LocalGridSearcher(LocalSearcher):
         return self._grid_length - self._grid_index
 
     def get_config(self):
-        """ Return new hyperparameter configuration to try next."""
+        """Return new hyperparameter configuration to try next."""
         if len(self) <= 0:
-            raise AssertionError(f'No configs left to get. All {self._grid_length} configs have been accessed already.')
+            raise AssertionError(f"No configs left to get. All {self._grid_length} configs have been accessed already.")
         config = self._params_grid[self._grid_index]
         self._grid_index += 1
         for key, val in config.items():

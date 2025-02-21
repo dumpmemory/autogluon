@@ -7,7 +7,7 @@ from autogluon.multimodal.data.templates import DatasetTemplates, Template, Temp
 
 from ..constants import AUTOMM
 
-logger = logging.getLogger(AUTOMM)
+logger = logging.getLogger(__name__)
 
 
 class TemplateEngine:
@@ -56,6 +56,21 @@ class TemplateEngine:
 
     def get_templates(self):
         return self.templates
+
+    def get_max_choice_length(self, tokenizer):
+        text = {}
+        max_length = 0
+        for template in self.templates:
+            answer_choices = template.get_answer_choices_list(text)
+            for choice in answer_choices:
+                answer_ids = tokenizer(
+                    choice,
+                )["input_ids"]
+                curr_length = len(answer_ids)
+                if curr_length > max_length:
+                    max_length = curr_length
+
+        return max_length
 
     def sample_and_apply_template(self, example: dict):
         """

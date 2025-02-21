@@ -3,12 +3,12 @@ import logging
 import os
 import random
 from functools import lru_cache
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForSeq2SeqLM
 from transformers import logging as hf_logging
 
 from ..constants import (
@@ -26,11 +26,11 @@ from ..constants import (
     TEXT_TOKEN_IDS,
     TEXT_VALID_LENGTH,
 )
-from .utils import DummyLayer, assign_layer_ids, get_column_features
+from .utils import DummyLayer, assign_layer_ids, get_column_features, get_pretrained_tokenizer
 
 hf_logging.set_verbosity_error()
 
-logger = logging.getLogger(AUTOMM)
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(None)
@@ -53,7 +53,9 @@ class TFewModel(nn.Module):
         unlikely_loss: float = 1.0,  # Adds loss term that lowers probability of incorrect outputs
         mc_loss: float = 1.0,  # Adds multiple choice cross entropy loss
         gradient_checkpointing: Optional[bool] = False,
+        low_cpu_mem_usage: Optional[bool] = False,
         pretrained: Optional[bool] = True,
+        tokenizer_name: Optional[str] = "hf_auto",
     ):
         """
         Load a pretrained T5-based text transformer backbone.
@@ -71,16 +73,20 @@ class TFewModel(nn.Module):
                 - 'bigscience/T0pp'
         num_classes
             The number of classes. 1 for a regression task.
-        gradient_checkpointing
-            Whether to enable gradient checkpointing
         length_norm
              Normalizes length to adjust for length bias in target template
         unlikely_loss
             Adds loss term that lowers probability of incorrect outputs
         mc_loss
             Adds multiple choice cross entropy loss
+        gradient_checkpointing
+            Whether to enable gradient checkpointing
+        low_cpu_mem_usage
+            Whether to turn on the optimization of reducing the peak CPU memory usage when loading the pretrained model.
         pretrained
             Whether using the pretrained weights. If pretrained=True, download the pretrained model.
+        tokenizer_name
+            Name of the huggingface tokenizer type.
         """
         super().__init__()
         logger.debug(f"initializing {checkpoint_name}")
@@ -91,11 +97,15 @@ class TFewModel(nn.Module):
         self.config = AutoConfig.from_pretrained(checkpoint_name)
 
         if pretrained:
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(checkpoint_name)
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(checkpoint_name, low_cpu_mem_usage=low_cpu_mem_usage)
         else:
             self.model = AutoModelForSeq2SeqLM.from_config(self.config)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_name)
+        self.tokenizer_name = tokenizer_name
+        self.tokenizer = get_pretrained_tokenizer(
+            tokenizer_name=self.tokenizer_name,
+            checkpoint_name=self.checkpoint_name,
+        )
         self.eos_token = self.tokenizer.eos_token
         self.out_features = (
             self.model.config.hidden_size
@@ -128,6 +138,10 @@ class TFewModel(nn.Module):
         return f"{self.prefix}_{TEXT_VALID_LENGTH}"
 
     @property
+    def input_keys(self):
+        return [self.text_token_ids_key, self.text_valid_length_key, self.choices_key]
+
+    @property
     def label_key(self):
         return f"{self.prefix}_{LABEL}"
 
@@ -145,14 +159,25 @@ class TFewModel(nn.Module):
 
     def forward(
         self,
-        batch: dict,
+        text_token_ids: torch.Tensor,
+        text_valid_length: torch.Tensor,
+        choices_ids: Optional[torch.Tensor] = None,
+        text_column_names: Optional[List[str]] = None,
+        text_column_indices: Optional[List[torch.Tensor]] = None,
     ):
         """
         Parameters
         ----------
-        batch
-            A dictionary containing the input mini-batch data.
-            We need to use the keys with the model prefix to index required data.
+        text_token_ids : torch.Tensor
+            Indices of input sequence tokens in the vocabulary.
+        text_valid_length : torch.Tensor
+            Valid length of the input text sequence.
+        choices_ids : torch.Tensor, optional
+            The choices ids for multiple-choices tasks.
+        text_column_names : list of str, optional
+            Names of the text columns.
+        text_column_indices : list of torch.Tensor, optional
+            Start and stop indices of the text columns.
 
         Returns
         -------
@@ -160,34 +185,30 @@ class TFewModel(nn.Module):
         """
         # TODO: Bad style, check for choices in multimodal.data. Split TemplateEngine into TextTemplateEngine and LabelTemplateEngine.
 
-        if not batch[self.choices_key].numel():
+        if not choices_ids.numel():
             warn_once(
                 logger,
                 msg="No target choices found in batch. Ensure that 'data.templates_turn_on=True' and that a valid preset or custom templates are provided.",
             )
             warn_once(logger, msg="Fallback to numerical representation of classes...")
-            batch[self.choices_key] = (
+            choices_ids = (
                 self.tokenizer([str(i) for i in range(self.num_classes)], return_tensors="pt", padding=True)[
                     "input_ids"
                 ]
-                .repeat(batch[self.text_token_ids_key].size(0), 1, 1)
-                .to(batch[self.text_token_ids_key])
+                .repeat(text_token_ids.size(0), 1, 1)
+                .to(text_token_ids)
             )
 
         assert (
-            batch[self.choices_key].size(1) == self.num_classes
+            choices_ids.size(1) == self.num_classes
         ), f"Number of target choices is different from number of classes, but they must be the same. Please check template."
-
-        text_token_ids = batch[self.text_token_ids_key]
 
         bs = text_token_ids.size(0)
         # TODO(?) Currently does not support mixed-task batching, but can be added by adjusting the label_templates dict.
-        choices_ids = batch[self.choices_key]
 
         bs, num_choices = choices_ids.size()[:2]
         flat_choices_ids = choices_ids.flatten(0, 1)
 
-        text_valid_length = batch[self.text_valid_length_key]
         text_masks = (text_token_ids != self.tokenizer.pad_token_id).float()
 
         inputs_embeds = self.model.encoder.embed_tokens(text_token_ids)
@@ -231,25 +252,55 @@ class TFewModel(nn.Module):
         # Use the entropy score as the class "logit" scoring of T-Few.
         choices_scores = -choices_scores
 
-        ret = {COLUMN_FEATURES: {FEATURES: {}, MASKS: {}}}
         #  FIXME(?) Not sure having column features with the decoder vocabulary logits in T-Few makes sense
+        batch = {
+            self.text_token_ids_key: text_token_ids,
+            self.text_valid_length_key: text_valid_length,
+            self.choices_key: choices_ids,
+        }
+        if text_column_names:
+            assert len(text_column_names) == len(text_column_indices), "invalid text column inputs"
+            for idx, name in enumerate(text_column_names):
+                batch[name] = text_column_indices[idx]
         column_features, column_feature_masks = get_column_features(
             batch=batch,
             column_name_prefix=self.text_column_prefix,
             features=model_output,
             valid_lengths=text_valid_length,
         )
-        ret[COLUMN_FEATURES][FEATURES].update(column_features)
-        ret[COLUMN_FEATURES][MASKS].update(column_feature_masks)
+
+        # needed to ensure compatibility to encoder-only pipelines
+        features = encoder_hidden_states_or[:, 0, :]
+        logits = choices_scores
+
+        target_template_logits = target_template_logits.view(bs, num_choices, *target_template_logits.size()[1:])
+        lm_target = lm_target.view(bs, num_choices, *lm_target.size()[1:])
+
+        if column_features == {} or column_feature_masks == {}:
+            return features, logits, target_template_logits, lm_target
+        else:
+            return features, logits, target_template_logits, lm_target, column_features, column_feature_masks
+
+    def get_output_dict(
+        self,
+        features: torch.Tensor,
+        logits: torch.Tensor,
+        target_template_logits: torch.Tensor,
+        lm_target: torch.Tensor,
+        column_features: Optional[Dict[str, torch.Tensor]] = None,
+        column_feature_masks: Optional[Dict[str, torch.Tensor]] = None,
+    ):
+        ret = {COLUMN_FEATURES: {FEATURES: {}, MASKS: {}}}
+        if column_features != None:
+            ret[COLUMN_FEATURES][FEATURES].update(column_features)
+            ret[COLUMN_FEATURES][MASKS].update(column_feature_masks)
 
         ret.update(
             {
-                LOGITS: choices_scores,  # needed for default crossentropy loss
+                LOGITS: logits,  # needed for default crossentropy loss
                 TEMPLATE_LOGITS: target_template_logits,  # needed for unlikelihood loss
                 LM_TARGET: lm_target,  # needed for lm loss
-                FEATURES: encoder_hidden_states_or[
-                    :, 0, :
-                ],  # needed to ensure compatibility to encoder-only pipelines
+                FEATURES: features,
             }
         )
 

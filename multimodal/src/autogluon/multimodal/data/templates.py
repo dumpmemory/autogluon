@@ -19,7 +19,7 @@ from jinja2 import BaseLoader, Environment, meta
 
 from ..constants import AUTOMM
 
-logger = logging.getLogger(AUTOMM)
+logger = logging.getLogger(__name__)
 
 # Local path to the folder containing the templates
 TEMPLATES_FOLDER_PATH = pkg_resources.resource_filename(__name__, "templates")
@@ -491,7 +491,6 @@ class TemplateCollection:
     """
 
     def __init__(self):
-
         # Dict of all the DatasetTemplates, key is the tuple (dataset_name, subset_name)
         fetching_templates_if_not_exist()
         self.datasets_templates: Dict[(str, Optional[str]), DatasetTemplates] = self._collect_datasets()
