@@ -1,9 +1,10 @@
+from autogluon.common.utils.log_utils import _add_stream_handler
+
 try:
     from .version import __version__
 except ImportError:
     pass
 
-from . import constants, data, models, optimization, predictor, utils
-from .matcher import MultiModalMatcher
-from .predictor import AutoMMPredictor, MultiModalPredictor
-from .utils import download
+from .predictor import MultiModalPredictor
+
+_add_stream_handler()

@@ -2,9 +2,9 @@ import logging
 import pickle
 from collections import OrderedDict
 
-from ..space import Categorical, Space
+from autogluon.common import space
 
-__all__ = ['LocalSearcher']
+__all__ = ["LocalSearcher"]
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,8 @@ class LocalSearcher(object):
         The configuration space to sample from. It contains the full
         specification of the Hyperparameters with their priors
     """
-    def __init__(self, search_space: dict, reward_attribute: str = 'reward', **kwargs):
+
+    def __init__(self, search_space: dict, reward_attribute: str = "reward", **kwargs):
         """
         :param search_space: Configuration space to sample from or search in
         :param reward_attribute: Reward attribute passed to update.
@@ -49,6 +50,7 @@ class LocalSearcher(object):
 
         """
         from ..scheduler.seq_scheduler import LocalSequentialScheduler
+
         if isinstance(scheduler, LocalSequentialScheduler):
             self._reward_attribute = scheduler._reward_attr
 
@@ -68,7 +70,7 @@ class LocalSearcher(object):
         returns: (config, info_dict)
             must return a valid configuration and a (possibly empty) info dict
         """
-        raise NotImplementedError(f'This function needs to be overwritten in {self.__class__.__name__}.')
+        raise NotImplementedError(f"This function needs to be overwritten in {self.__class__.__name__}.")
 
     def update(self, config: dict, **kwargs):
         """
@@ -102,22 +104,20 @@ class LocalSearcher(object):
 
     def get_best_reward(self):
         """Calculates the reward (i.e. validation performance) produced by training under the best configuration identified so far.
-           Assumes higher reward values indicate better performance.
+        Assumes higher reward values indicate better performance.
         """
         if self._results:
             return max(self._results.values())
         return self._reward_while_pending()
 
     def get_reward(self, config):
-        """Calculates the reward (i.e. validation performance) produced by training with the given configuration.
-        """
+        """Calculates the reward (i.e. validation performance) produced by training with the given configuration."""
         config_pkl = self._pickle_config(config=config)
         assert config_pkl in self._results
         return self._results[config_pkl]
 
     def get_best_config(self):
-        """Returns the best configuration found so far.
-        """
+        """Returns the best configuration found so far."""
         if self._results:
             config_pkl = max(self._results, key=self._results.get)
             return self._unpickle_config(config_pkl=config_pkl)
@@ -148,7 +148,7 @@ class LocalSearcher(object):
         """
         params_static = dict()
         for key, val in self.search_space.items():
-            if not isinstance(val, Space):
+            if not isinstance(val, space.Space):
                 params_static[key] = val
         return params_static
 
@@ -158,7 +158,7 @@ class LocalSearcher(object):
         """
         params_default = dict()
         for key, val in self.search_space.items():
-            if isinstance(val, Space):
+            if isinstance(val, space.Space):
                 params_default[key] = val.default
         params_default.update(params_static)
         return params_default
@@ -171,7 +171,7 @@ class LocalSearcher(object):
         """
         params_cat_dict = dict()
         for key, val in self.search_space.items():
-            if isinstance(val, Categorical):
+            if isinstance(val, space.Categorical):
                 cat_map = dict()
                 for i, cat in enumerate(val.data):
                     cat_pkl = pickle.dumps(cat)
@@ -187,9 +187,9 @@ class LocalSearcher(object):
 
     def _pickle_config(self, config: dict) -> bytes:
         assert isinstance(config, dict), f"config must be a dict! Was instead {type(config)} | Value: {config}"
-        assert len(config) == len(self._params_order), f'Config length does not match expected params count!\n' \
-                                                       f'Expected: {self._params_order}\n' \
-                                                       f'Actual:   {list(config.keys())}'
+        assert len(config) == len(self._params_order), (
+            f"Config length does not match expected params count!\n" f"Expected: {self._params_order}\n" f"Actual:   {list(config.keys())}"
+        )
 
         # Note: This code is commented out because it can be computationally and memory expensive if user sends large objects in search space, such as datasets.
         """
@@ -205,8 +205,10 @@ class LocalSearcher(object):
                 try:
                     cat_idx = self._params_cat_dict[key][pickle.dumps(config[key])]
                 except KeyError:
-                    raise AssertionError(f'Invalid config value for search space parameter "{key}" | '
-                                         f'Invalid Value: {config[key]} | Valid Values: {self.search_space[key].data}')
+                    raise AssertionError(
+                        f'Invalid config value for search space parameter "{key}" | '
+                        f"Invalid Value: {config[key]} | Valid Values: {self.search_space[key].data}"
+                    )
                 config_to_pkl.append(cat_idx)
             else:
                 config_to_pkl.append(config[key])
