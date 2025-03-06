@@ -6,7 +6,7 @@ import pandas as pd
 from pandas import DataFrame
 from sklearn.preprocessing import OneHotEncoder
 
-from autogluon.common.features.types import R_CATEGORY, S_BOOL, S_SPARSE, R_INT
+from autogluon.common.features.types import R_CATEGORY, R_INT, S_BOOL, S_SPARSE
 
 from .abstract import AbstractFeatureGenerator
 
@@ -29,7 +29,8 @@ class CatToInt:
         If 'na', uses `fillna_val`.
         If 'na+1', uses `fillna_val+1`. This guarantees a new category for infrequent values separate from missing values if `fillna_val=None`.
     """
-    def __init__(self, max_levels, fillna_val=None, infrequent_val='na'):
+
+    def __init__(self, max_levels, fillna_val=None, infrequent_val="na"):
         self.max_levels = max_levels
         self.fillna_val = fillna_val
         self.infrequent_val = infrequent_val
@@ -42,9 +43,9 @@ class CatToInt:
         self._dtype, fillna_val = self._get_dtype_and_fillna(X, dtype_buffer=2)
         if self.fillna_val is None:
             self.fillna_val = fillna_val
-        if self.infrequent_val == 'na':
+        if self.infrequent_val == "na":
             self.infrequent_val = self.fillna_val
-        elif self.infrequent_val == 'na+1':
+        elif self.infrequent_val == "na+1":
             self.infrequent_val = self.fillna_val + 1
 
         X = self.pd_to_np(X)
@@ -52,13 +53,13 @@ class CatToInt:
         for col in range(self.num_cols):
             data = X[:, col]
             uniques, counts = np.unique(data, return_counts=True)
-            self.cats[col] = uniques[np.argsort(counts)[-self.max_levels:]]
+            self.cats[col] = uniques[np.argsort(counts)[-self.max_levels :]]
             with warnings.catch_warnings():
                 # Refer to https://stackoverflow.com/questions/40659212/futurewarning-elementwise-comparison-failed-returning-scalar-but-in-the-futur
-                warnings.simplefilter(action='ignore', category=FutureWarning)
+                warnings.simplefilter(action="ignore", category=FutureWarning)
                 if self.infrequent_val in self.cats[col] or str(self.infrequent_val) in self.cats[col]:
                     # Add one extra level since NaN values shouldn't be counted towards max levels
-                    self.cats[col] = uniques[np.argsort(counts)[-(self.max_levels+1):]]
+                    self.cats[col] = uniques[np.argsort(counts)[-(self.max_levels + 1) :]]
 
     def transform(self, X: DataFrame):
         X = self.pd_to_np(X)
@@ -69,10 +70,18 @@ class CatToInt:
         return X
 
     def pd_to_np(self, X: DataFrame) -> np.ndarray:
-        return X.to_numpy(dtype=self._dtype, na_value=self.fillna_val, copy=True)
+        """
+        Converts pandas categoricals to a numpy ndarray of the codes of the categories.
+        """
+        with warnings.catch_warnings():
+            if np.issubdtype(self._dtype, np.integer):
+                # Filter incorrect pandas RuntimeWarning message
+                # For more details, refer to https://github.com/autogluon/autogluon/pull/4224#issuecomment-2156423410
+                warnings.filterwarnings("ignore", category=RuntimeWarning)
+            return X.to_numpy(dtype=self._dtype, na_value=self.fillna_val, copy=True)
 
     def _get_dtype_and_fillna(self, X: DataFrame, dtype_buffer=2):
-        assert dtype_buffer >= 1, 'dtype_buffer must be >= 1 or else fillna_val could be invalid.'
+        assert dtype_buffer >= 1, "dtype_buffer must be >= 1 or else fillna_val could be invalid."
         dtype = None
         max_val_all = None
         for col in X.columns:
@@ -121,11 +130,12 @@ class OneHotEncoderFeatureGenerator(AbstractFeatureGenerator):
     drop : str, default = None
         Refer to OneHotEncoder documentation for details.
     """
+
     def __init__(self, max_levels=None, dtype=np.uint8, sparse=True, drop=None, **kwargs):
         super().__init__(**kwargs)
         self.max_levels = max_levels
         self.sparse = sparse
-        self._ohe = OneHotEncoder(dtype=dtype, sparse=self.sparse, handle_unknown='ignore', drop=drop)
+        self._ohe = OneHotEncoder(dtype=dtype, sparse_output=self.sparse, handle_unknown="ignore", drop=drop)
         self._ohe_columns = None
         self._cat_feat_gen = None
 
@@ -139,6 +149,7 @@ class OneHotEncoderFeatureGenerator(AbstractFeatureGenerator):
 
         self._ohe.fit(X_out)
         self._ohe_columns = self._ohe.get_feature_names_out()
+        self._ohe_columns = ["_ohe_" + str(i) for i in range(len(self._ohe_columns))]
         X_out = self._transform(X)
 
         features_out = list(X_out.columns)
@@ -171,4 +182,4 @@ class OneHotEncoderFeatureGenerator(AbstractFeatureGenerator):
         return X
 
     def _more_tags(self):
-        return {'feature_interactions': False}
+        return {"feature_interactions": False}

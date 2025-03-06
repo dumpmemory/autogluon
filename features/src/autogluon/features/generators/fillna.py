@@ -1,4 +1,5 @@
 import logging
+import warnings
 
 import numpy as np
 from pandas import DataFrame
@@ -32,10 +33,11 @@ class FillNaFeatureGenerator(AbstractFeatureGenerator):
     **kwargs :
         Refer to :class:`AbstractFeatureGenerator` documentation for details on valid key word arguments.
     """
+
     def __init__(self, fillna_map=None, fillna_default=np.nan, inplace=False, **kwargs):
         super().__init__(**kwargs)
         if fillna_map is None:
-            fillna_map = {R_OBJECT: ''}
+            fillna_map = {R_OBJECT: ""}
         self.fillna_map = fillna_map
         self.fillna_default = fillna_default
         self._fillna_feature_map = None
@@ -53,10 +55,21 @@ class FillNaFeatureGenerator(AbstractFeatureGenerator):
 
     def _transform(self, X: DataFrame) -> DataFrame:
         if self._fillna_feature_map:
-            if self.inplace:
-                X.fillna(self._fillna_feature_map, inplace=True, downcast=False)
-            else:
-                X = X.fillna(self._fillna_feature_map, inplace=False, downcast=False)
+            with warnings.catch_warnings():
+                warnings.simplefilter(action="ignore", category=FutureWarning)
+                # FIXME: v1.1 Remove this warning filter and resolve.
+                #  In Pandas 2.1, the `downcast` argument was deprecated,
+                #  but we need it to avoid incorrect type conversion.
+                #  Pandas authors may have not considered our edge-case.
+                #  We specifically want to have an object dtype not be converted to a numeric dtype,
+                #  even if all of the values can be converted to numeric.
+                #  However, without specifying `downcast=False`, it will be converted to numeric, which we don't want.
+                #  Note: Non-trivial to keep current functionality without specifying `downcast=False`...
+                #  Doing so may end up slowing down the code noticeably.
+                if self.inplace:
+                    X.fillna(self._fillna_feature_map, inplace=True, downcast=False)
+                else:
+                    X = X.fillna(self._fillna_feature_map, inplace=False, downcast=False)
         return X
 
     @staticmethod
@@ -70,4 +83,4 @@ class FillNaFeatureGenerator(AbstractFeatureGenerator):
                 self._fillna_feature_map.pop(feature, None)
 
     def _more_tags(self):
-        return {'feature_interactions': False}
+        return {"feature_interactions": False}

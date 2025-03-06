@@ -4,11 +4,13 @@ from typing import List, Optional
 import pandas as pd
 
 from autogluon.features import AbstractFeatureGenerator, AutoMLPipelineFeatureGenerator
+
+from ..state import AnalysisState, StateCheckMixin
 from .base import AbstractAnalysis
-from ..state import AnalysisState
-from ..state import StateCheckMixin
 
 logger = logging.getLogger(__name__)
+
+__all__ = ["ApplyFeatureGenerator"]
 
 
 class ApplyFeatureGenerator(AbstractAnalysis, StateCheckMixin):
@@ -23,8 +25,13 @@ class ApplyFeatureGenerator(AbstractAnalysis, StateCheckMixin):
         feature generator to use for the transformation. If `None` is provided then `AutoMLPipelineFeatureGenerator` is applied.
     parent: Optional[AbstractAnalysis], default = None
         parent Analysis
-    children: List[AbstractAnalysis], default []
+    children: Optional[List[AbstractAnalysis]], default None
         wrapped analyses; these will receive sampled `args` during `fit` call
+    verbosity: int, default = 0,
+        Verbosity levels range from 0 to 4 and control how much information is printed.
+        Higher levels correspond to more detailed print statements (you can set verbosity = 0 to suppress warnings).
+        If using logging, you can alternatively control amount of information printed via `logger.setLevel(L)`,
+        where `L` ranges from 0 to 50 (Note: higher values of `L` correspond to fewer print statements, opposite of verbosity levels).
     kwargs
 
     See also :func:`autogluon.features.AbstractFeatureGenerator`
@@ -48,13 +55,16 @@ class ApplyFeatureGenerator(AbstractAnalysis, StateCheckMixin):
 
     """
 
-    def __init__(self,
-                 parent: Optional[AbstractAnalysis] = None,
-                 children: Optional[List[AbstractAnalysis]] = None,
-                 state: Optional[AnalysisState] = None,
-                 category_to_numbers: bool = False,
-                 feature_generator: Optional[AbstractFeatureGenerator] = None,
-                 **kwargs) -> None:
+    def __init__(
+        self,
+        parent: Optional[AbstractAnalysis] = None,
+        children: Optional[List[AbstractAnalysis]] = None,
+        state: Optional[AnalysisState] = None,
+        category_to_numbers: bool = False,
+        feature_generator: Optional[AbstractFeatureGenerator] = None,
+        verbosity: int = 0,
+        **kwargs,
+    ) -> None:
         super().__init__(parent, children, state, **kwargs)
         self.category_to_numbers = category_to_numbers
         if feature_generator is None:
@@ -66,17 +76,21 @@ class ApplyFeatureGenerator(AbstractAnalysis, StateCheckMixin):
                 enable_text_ngram_features=False,
                 enable_raw_text_features=False,
                 enable_vision_features=False,
+                verbosity=verbosity,
+                **kwargs,
             )
         self.feature_generator = feature_generator
 
     def can_handle(self, state: AnalysisState, args: AnalysisState) -> bool:
-        return self.all_keys_must_be_present(args, 'train_data', 'label')
+        return self.all_keys_must_be_present(args, "train_data", "label")
 
     def _fit(self, state: AnalysisState, args: AnalysisState, **fit_kwargs) -> None:
-        x = args.train_data.drop(columns=args.label)
+        x = args.train_data
+        if (args.label is not None) and (args.label in x.columns):
+            x = x.drop(columns=args.label)
         self.feature_generator.fit(x)
-        self.args['feature_generator'] = True
-        for (ds, df) in self.available_datasets(args):
+        self.args["feature_generator"] = True
+        for ds, df in self.available_datasets(args):
             x = df
             y = None
             if args.label in df.columns:
@@ -85,7 +99,7 @@ class ApplyFeatureGenerator(AbstractAnalysis, StateCheckMixin):
             x_tx = self.feature_generator.transform(x)
             if self.category_to_numbers:
                 for col, dtype in x_tx.dtypes.items():
-                    if dtype == 'category':
+                    if dtype == "category":
                         x_tx[col] = x_tx[col].cat.codes
             if y is not None:
                 x_tx = pd.concat([x_tx, y], axis=1)

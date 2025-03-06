@@ -1,5 +1,5 @@
 import copy
-from typing import Union, List, Any, Optional, Dict
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -8,17 +8,37 @@ from autogluon.core.constants import BINARY
 from autogluon.core.metrics import BINARY_METRICS, roc_auc
 from autogluon.core.utils import generate_train_test_split
 from autogluon.tabular import TabularPredictor
-from .base import AbstractAnalysis
+
 from .. import AnalysisState
 from ..state import StateCheckMixin
+from .base import AbstractAnalysis
 
-__all__ = ['XShiftDetector']
+__all__ = ["XShiftDetector"]
 
 
 class XShiftDetector(AbstractAnalysis, StateCheckMixin):
     """Detect a change in covariate (X) distribution between training and test, which we call XShift.  It can tell you
     if your training set is not representative of your test set distribution.  This is done with a Classifier 2
     Sample Test.
+
+    State attributes
+
+    - `xshift_results.detection_status`:
+        bool, True if detected
+    - `xshift_results.test_statistic`: float
+        Classifier Two-Sample Test (C2ST) statistic. It is a measure how well a classifier distinguishes between the samples from the training and test sets.
+        If the classifier can accurately separate the samples, it suggests that the input distributions differ significantly, indicating the presence of
+        covariate shift. A C2ST value close to 0.5 implies that the classifier struggles to differentiate between the sets, indicating minimal covariate shift.
+        In contrast, a value significantly different from 0.5 suggests the presence of covariate shift, warranting further investigation and potential
+        adjustments to the model or data preprocessing.
+    - `xshift_results.pvalue`: float
+        p-value using permutation test
+    - `xshift_results.pvalue_threshold`: float,
+        decision boundary of p-value threshold
+    - `xshift_results.feature_importance`: DataFrame,
+        the feature importance dataframe, if computed
+    - `xshift_results.shift_features`
+        list of features whose contribution is statistically significant; only present if `xshift_results.detection_status = True`
 
     Parameters
     ----------
@@ -30,7 +50,7 @@ class XShiftDetector(AbstractAnalysis, StateCheckMixin):
         The threshold for the pvalue
     eval_metric : str, default = 'balanced_accuracy'
         The metric used for the C2ST, it must be one of the binary metrics from autogluon.core.metrics
-    sample_label : str, default = 'i2vkyc0p64'
+    sample_label : str, default = '__label__'
         The label internally used for the classifier 2 sample test, the only reason to change it is in the off chance
         that the default value is a column in the data.
     classifier_kwargs : dict, default = {}
@@ -42,30 +62,23 @@ class XShiftDetector(AbstractAnalysis, StateCheckMixin):
     test_size_2st: float, default = 0.3
         The size of the test set in the training test split in 2ST
 
-    State attributes
-    ----------------
-    state.xshift_results: outputs the results of XShift detection,
-        dict of
-            - 'detection_status': bool, True if detected
-            - 'test_statistic': float, the C2ST statistic
-            - 'pvalue': float, the p-value using permutation test
-            - 'pvalue_threshold': float, the decision p-value threshold
-            - 'feature_importance': DataFrame, the feature importance dataframe, if computed
     """
 
-    def __init__(self,
-                 classifier_class: Any = TabularPredictor,
-                 compute_fi: bool = True,
-                 pvalue_thresh: float = 0.01,
-                 eval_metric: str = 'roc_auc',
-                 sample_label: str = 'i2vkyc0p64',
-                 classifier_kwargs: dict = None,
-                 classifier_fit_kwargs: dict = None,
-                 num_permutations: int = 1000,
-                 test_size_2st: float = 0.3,
-                 parent: Union[None, AbstractAnalysis] = None,
-                 children: Optional[List[AbstractAnalysis]] = None,
-                 **kwargs) -> None:
+    def __init__(
+        self,
+        classifier_class: Any = TabularPredictor,
+        compute_fi: bool = True,
+        pvalue_thresh: float = 0.01,
+        eval_metric: str = "roc_auc",
+        sample_label: str = "__label__",
+        classifier_kwargs: Optional[dict] = None,
+        classifier_fit_kwargs: Optional[dict] = None,
+        num_permutations: int = 1000,
+        test_size_2st: float = 0.3,
+        parent: Union[None, AbstractAnalysis] = None,
+        children: Optional[List[AbstractAnalysis]] = None,
+        **kwargs,
+    ) -> None:
         super().__init__(parent, children, **kwargs)
         if classifier_kwargs is None:
             classifier_kwargs = {}
@@ -76,36 +89,40 @@ class XShiftDetector(AbstractAnalysis, StateCheckMixin):
         self.classifier_class = classifier_class
         self.compute_fi = compute_fi
         named_metrics = BINARY_METRICS
-        assert eval_metric in named_metrics.keys(), \
-            'eval_metric must be one of [' + ', '.join(named_metrics.keys()) + ']'
+        assert eval_metric in named_metrics.keys(), (
+            "eval_metric must be one of [" + ", ".join(named_metrics.keys()) + "]"
+        )
         self.eval_metric = named_metrics[eval_metric]
-        self.C2ST = Classifier2ST(classifier_class,
-                                  sample_label=sample_label,
-                                  eval_metric=self.eval_metric,
-                                  compute_fi=compute_fi,
-                                  classifier_kwargs=classifier_kwargs,
-                                  test_size_2st=test_size_2st)
+        self.C2ST = Classifier2ST(
+            classifier_class,
+            sample_label=sample_label,
+            eval_metric=self.eval_metric,
+            compute_fi=compute_fi,
+            classifier_kwargs=classifier_kwargs,
+            test_size_2st=test_size_2st,
+        )
         self.fi_scores = None
         self.compute_fi = compute_fi
         self.pvalue_thresh = pvalue_thresh
         self.num_permutations = num_permutations
 
     def can_handle(self, state: AnalysisState, args: AnalysisState) -> bool:
-        return self.all_keys_must_be_present(args, 'train_data', 'test_data')
+        return self.all_keys_must_be_present(args, "train_data", "test_data")
 
-    def _fit(self, state: AnalysisState, args: AnalysisState, **fit_kwargs):
-        """ Fit method.  `args` can contain
+    def _fit(self, state: AnalysisState, args: AnalysisState, **fit_kwargs) -> None:
+        """Fit method.  `args` can contain
         - 'train_data': pd.DataFrame, required
         - 'test_data': pd.DataFrame, required
         - 'label': str, optional
             The Y variable that is to be predicted (if it appears in the train/test data then it will be removed)
         """
-        X = args['train_data'].copy()
-        X_test = args['test_data'].copy()
-        assert self.C2ST.sample_label not in X.columns, \
-            f'your data columns contain {self.C2ST.sample_label} which is used internally'
-        if 'label' in args:
-            label = args['label']
+        X = args["train_data"].copy()
+        X_test = args["test_data"].copy()
+        assert (
+            self.C2ST.sample_label not in X.columns
+        ), f"your data columns contain {self.C2ST.sample_label} which is used internally"
+        if "label" in args:
+            label = args["label"]
             if label in X.columns:
                 X = X.drop(columns=[label])
             if label in X_test.columns:
@@ -117,22 +134,29 @@ class XShiftDetector(AbstractAnalysis, StateCheckMixin):
         else:
             fi_scores = None
         pvalue = self.C2ST.pvalue(num_permutations=self.num_permutations)
-        det_status = pvalue <= self.pvalue_thresh
+
+        detection_status = bool(pvalue <= self.pvalue_thresh)  # numpy.bool_ -> bool
+
         state.xshift_results = {
-            'detection_status': det_status,
-            'test_statistic': self.C2ST.test_stat,
-            'pvalue': pvalue,
-            'pvalue_threshold': self.pvalue_thresh,
-            'eval_metric': self.eval_metric.name,
-            'feature_importance': fi_scores,
+            "detection_status": detection_status,
+            "test_statistic": self.C2ST.test_stat,
+            "pvalue": pvalue,
+            "pvalue_threshold": self.pvalue_thresh,
+            "eval_metric": self.eval_metric.name,
+            "feature_importance": fi_scores,
         }
+
+        if detection_status:
+            fi_scores = fi_scores[fi_scores.p_value <= self.pvalue_thresh]
+            shift_features = fi_scores.index.tolist()
+            state.xshift_results["shift_features"] = shift_features
 
 
 def post_fit(func):
     """decorator for post-fit methods"""
 
     def pff_wrapper(self, *args, **kwargs):
-        assert self._is_fit, f'.fit needs to be called prior to .{func.__name__}'
+        assert self._is_fit, f".fit needs to be called prior to .{func.__name__}"
         return func(self, *args, **kwargs)
 
     return pff_wrapper
@@ -163,21 +187,21 @@ class Classifier2ST:
         The size of the test set in the training test split in 2ST
     """
 
-    def __init__(self,
-                 classifier_class,
-                 sample_label='xshift_label',
-                 eval_metric=roc_auc,
-                 split=0.5,
-                 compute_fi=True,
-                 classifier_kwargs: Optional[Dict] = None,
-                 test_size_2st=0.3,
-                 ):
-
+    def __init__(
+        self,
+        classifier_class,
+        sample_label="xshift_label",
+        eval_metric=roc_auc,
+        split=0.5,
+        compute_fi=True,
+        classifier_kwargs: Optional[Dict] = None,
+        test_size_2st=0.3,
+    ):
         if classifier_kwargs is None:
             classifier_kwargs = {}
         else:
             classifier_kwargs = copy.deepcopy(classifier_kwargs)
-        classifier_kwargs.update({'label': sample_label, 'eval_metric': eval_metric})
+        classifier_kwargs.update({"label": sample_label, "eval_metric": eval_metric})
         self.classifier = classifier_class(**classifier_kwargs)
         self.classifier_class = classifier_class
         self.split = split
@@ -219,23 +243,21 @@ class Classifier2ST:
             data = self._make_source_target_label(data, self.sample_label)  # makes a copy
         if data.index.has_duplicates:
             data = data.reset_index(drop=True)
-        train, test, y_train, y_test = generate_train_test_split(data.drop(columns=[self.sample_label]),
-                                                                 data[self.sample_label],
-                                                                 BINARY,
-                                                                 test_size=self.test_size_2st)
+        train, test, y_train, y_test = generate_train_test_split(
+            data.drop(columns=[self.sample_label]), data[self.sample_label], BINARY, test_size=self.test_size_2st
+        )
         train[self.sample_label] = y_train
         test[self.sample_label] = y_test
         self.classifier.fit(train, **kwargs)
         yhat = self.classifier.predict_proba(test)[1]
         self.test_stat = self.eval_metric(test[self.sample_label], yhat)
-        self.has_fi = (getattr(self.classifier, "feature_importance", None) is not None)
+        self.has_fi = getattr(self.classifier, "feature_importance", None) is not None
         if self.has_fi and self.compute_fi:
             self._test = test  # for feature importance
         self._is_fit = True
 
     @post_fit
-    def _pvalue_half_permutation(self,
-                                 num_permutations=1000):
+    def _pvalue_half_permutation(self, num_permutations=1000):
         """The half permutation method for computing p-values.
         See Section 9.2 of https://arxiv.org/pdf/1602.02210.pdf
         """
@@ -243,17 +265,13 @@ class Classifier2ST:
         yhat = self.classifier.predict_proba(self._test)[1]
         for _ in range(num_permutations):
             perm_yhat = np.random.permutation(yhat)
-            perm_test_stat = self.eval_metric(
-                self._test[self.sample_label],  # type: ignore
-                perm_yhat
-            )
+            perm_test_stat = self.eval_metric(self._test[self.sample_label], perm_yhat)  # type: ignore
             perm_stats.append(perm_test_stat)
         pval = (self.test_stat <= np.array(perm_stats)).mean()
         return pval
 
     @post_fit
-    def pvalue(self,
-               num_permutations: int = 1000):
+    def pvalue(self, num_permutations: int = 1000):
         """Compute the p-value which measures the significance level for the test statistic
 
         Parameters

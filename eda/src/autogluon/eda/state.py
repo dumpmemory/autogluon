@@ -1,12 +1,13 @@
 import logging
 
-__all__ = ['AnalysisState', 'StateCheckMixin']
+__all__ = ["AnalysisState", "StateCheckMixin", "is_key_present_in_state"]
 
 from typing import Any
 
 
 class AnalysisState(dict):
     """Enabling dot.notation access to dictionary attributes and dynamic code assist in jupyter"""
+
     _getattr__ = dict.get
     __delattr__ = dict.__delitem__  # type: ignore
 
@@ -56,9 +57,9 @@ class StateCheckMixin:
             True if at least one key from the `keys` list is present in the state
         """
         for k in keys:
-            if k in state:
+            if state.get(k, None) is not None:
                 return True
-        self.logger.warning(f'{self.__class__.__name__}: at least one of the following keys must be present: {keys}')
+        self.logger.warning(f"{self.__class__.__name__}: at least one of the following keys must be present: {keys}")
         return False
 
     def all_keys_must_be_present(self, state: AnalysisState, *keys) -> bool:
@@ -76,10 +77,35 @@ class StateCheckMixin:
         -------
             True if all the key from the `keys` list are present in the state
         """
-        keys_not_present = [k for k in keys if k not in state.keys()]
+        keys_not_present = [k for k in keys if state.get(k, None) is None]
         can_handle = len(keys_not_present) == 0
         if not can_handle:
             self.logger.warning(
                 f'{self.__class__.__name__}: all of the following keys must be present: [{", ".join(keys)}]. '
-                f'The following keys are missing: [{", ".join(keys_not_present)}]')
+                f'The following keys are missing: [{", ".join(keys_not_present)}]'
+            )
         return can_handle
+
+
+def is_key_present_in_state(state: AnalysisState, key: str):
+    """
+    Check if the nested key represented with dot notation (`a.b.c`) is present in the state
+    Parameters
+    ----------
+    state: AnalysisState
+        state to check the key in
+    key: str
+        the key to check for presence
+
+
+    Returns
+    -------
+    `True` if the key is present
+
+    """
+    path = state
+    for p in key.split("."):
+        if p not in path:
+            return False
+        path = path[p]
+    return True

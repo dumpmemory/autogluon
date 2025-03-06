@@ -1,15 +1,20 @@
+from __future__ import annotations
+
 import logging
 
 from autogluon.common.features.types import S_STACK
 
-from .ensemble_selection import EnsembleSelection, SimpleWeightedEnsemble
+from ...constants import MULTICLASS, QUANTILE, SOFTCLASS
 from ..abstract.abstract_model import AbstractModel
-from ...constants import MULTICLASS, SOFTCLASS, QUANTILE
+from .ensemble_selection import EnsembleSelection, SimpleWeightedEnsemble
 
 logger = logging.getLogger(__name__)
 
 
 class GreedyWeightedEnsembleModel(AbstractModel):
+    ag_key = "ENS_WEIGHTED"
+    ag_name = "WeightedEnsemble"
+
     def __init__(self, base_model_names=None, model_base=EnsembleSelection, **kwargs):
         super().__init__(**kwargs)
         self.model_base = model_base
@@ -18,7 +23,10 @@ class GreedyWeightedEnsembleModel(AbstractModel):
         self.weights_ = None
 
     def _set_default_params(self):
-        default_params = {'ensemble_size': 100}
+        default_params = {
+            "ensemble_size": 25,  # TabRepo reports that values above 25 lead to no measurable improvement.
+            "subsample_size": 1000000,  # subsample to this many rows if training row count exceeds this value to speed up training
+        }
         for param, val in default_params.items():
             self._set_default_param_value(param, val)
 
@@ -48,14 +56,7 @@ class GreedyWeightedEnsembleModel(AbstractModel):
         self.features = self._set_stack_columns(base_model_names=self.base_model_names)
 
     # TODO: Check memory after loading best model predictions, only load top X model predictions that fit in memory
-    def _fit(self,
-             X,
-             y,
-             X_val=None,
-             y_val=None,
-             time_limit=None,
-             sample_weight=None,
-             **kwargs):
+    def _fit(self, X, y, X_val=None, y_val=None, time_limit=None, sample_weight=None, **kwargs):
         params = self._get_model_params()
         if self.model is None:
             X = self.preprocess(X)
@@ -63,7 +64,7 @@ class GreedyWeightedEnsembleModel(AbstractModel):
             self.model = self.model.fit(X, y, time_limit=time_limit, sample_weight=sample_weight)
             self.base_model_names, self.model.weights_ = self.remove_zero_weight_models(self.base_model_names, self.model.weights_)
         self.features = self._set_stack_columns(base_model_names=self.base_model_names)
-        self.params_trained['ensemble_size'] = self.model.ensemble_size
+        self.params_trained["ensemble_size"] = self.model.ensemble_size
         self.weights_ = self.model.weights_
 
     def convert_pred_probas_df_to_list(self, pred_probas_df) -> list:
@@ -90,9 +91,9 @@ class GreedyWeightedEnsembleModel(AbstractModel):
 
     def _set_stack_columns(self, base_model_names):
         if self.problem_type in [MULTICLASS, SOFTCLASS]:
-            stack_columns = [model_name + '_' + str(cls) for model_name in base_model_names for cls in range(self.num_classes)]
+            stack_columns = [model_name + "_" + str(cls) for model_name in base_model_names for cls in range(self.num_classes)]
         elif self.problem_type == QUANTILE:
-            stack_columns = [model_name + '_' + str(q) for model_name in base_model_names for q in self.quantile_levels]
+            stack_columns = [model_name + "_" + str(q) for model_name in base_model_names for q in self.quantile_levels]
         else:
             stack_columns = base_model_names
         return stack_columns
@@ -101,46 +102,52 @@ class GreedyWeightedEnsembleModel(AbstractModel):
         stack_column_names = self.feature_metadata.get_features(required_special_types=[S_STACK])
 
         if self.problem_type == QUANTILE:
-            columns_class_0 = [column for column in stack_column_names if
-                               column.endswith('_{}'.format(str(self.quantile_levels[0])))]
-            base_model_names = [column.rsplit('_', 1)[0] for column in columns_class_0]
+            columns_class_0 = [column for column in stack_column_names if column.endswith("_{}".format(str(self.quantile_levels[0])))]
+            base_model_names = [column.rsplit("_", 1)[0] for column in columns_class_0]
         elif self.num_pred_cols_per_model > 1:
-            columns_class_0 = [column for column in stack_column_names if column.endswith('_0')]
+            columns_class_0 = [column for column in stack_column_names if column.endswith("_0")]
             base_model_names = [column[:-2] for column in columns_class_0]
         else:
             base_model_names = stack_column_names
         return base_model_names
 
-    def _get_model_weights(self):
+    def _get_model_weights(self) -> dict:
         num_models = len(self.base_model_names)
         model_weight_dict = {self.base_model_names[i]: self.weights_[i] for i in range(num_models)}
         return model_weight_dict
 
-    def get_info(self):
-        info = super().get_info()
-        info['model_weights'] = self._get_model_weights()
+    def get_info(self, **kwargs):
+        info = super().get_info(**kwargs)
+        info["model_weights"] = self._get_model_weights()
         return info
 
     @classmethod
     def _get_default_ag_args(cls) -> dict:
         default_ag_args = super()._get_default_ag_args()
-        extra_ag_args = {'valid_base': False}
+        extra_ag_args = {"valid_base": False}
         default_ag_args.update(extra_ag_args)
         return default_ag_args
+
+    @classmethod
+    def supported_problem_types(cls) -> list[str] | None:
+        return ["binary", "multiclass", "regression", "quantile", "softclass"]
 
     def _get_default_stopping_metric(self):
         return self.eval_metric
 
 
 class SimpleWeightedEnsembleModel(GreedyWeightedEnsembleModel):
+    ag_key = "SIMPLE_ENS_WEIGHTED"
+    ag_name = "WeightedEnsemble"
+
     def __init__(self, model_base=SimpleWeightedEnsemble, **kwargs):
         super().__init__(model_base=model_base, **kwargs)
 
     def _fit(self, **kwargs):
         params = self._get_model_params()
-        if 'weights' not in params:
+        if "weights" not in params:
             raise ValueError('Missing required parameter "weights" to fit SimpleWeightedEnsembleModel.')
-        if len(params['weights']) != len(self.base_model_names):
+        if len(params["weights"]) != len(self.base_model_names):
             raise AssertionError(f'Length of weights does not equal length of self.base_model_names ({len(params["weights"])}, {len(self.base_model_names)})')
 
         if self.model is None:

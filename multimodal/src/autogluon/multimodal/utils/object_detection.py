@@ -1,17 +1,294 @@
 import json
 import logging
 import os
+import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Union
 
 import defusedxml.ElementTree as ET
 import numpy as np
 import pandas as pd
+import PIL
+import torch
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
 
-from ..constants import AUTOMM
+from ..constants import (
+    BBOX,
+    LABEL,
+    MAP,
+    MAP_50,
+    MAP_75,
+    MAP_LARGE,
+    MAP_MEDIUM,
+    MAP_SMALL,
+    MAR_1,
+    MAR_10,
+    MAR_100,
+    MAR_LARGE,
+    MAR_MEDIUM,
+    MAR_SMALL,
+    MEAN_AVERAGE_PRECISION,
+)
 from .download import download, is_url
 
-logger = logging.getLogger(AUTOMM)
+logger = logging.getLogger(__name__)
+
+
+def _get_image_info(image_path: str):
+    """
+    Get the image width and height info
+    Parameters
+    ----------
+    image_path
+        str representing the path to the image
+    Returns
+    -------
+        dict containing image info. None if cannot open image
+    """
+    info_dict = {}
+    try:
+        with PIL.Image.open(image_path) as im:
+            height, width = im.size
+            info_dict["height"] = height
+            info_dict["width"] = width
+        return info_dict
+    except Exception as err:
+        warnings.warn(f"Skip image {image_path} due to {err}")
+        return None
+
+
+def get_df_unique_classes(data: pd.DataFrame):
+    """
+    Get the unique classes and their category IDs from the dataframe for object detection.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        DataFrame holding the data for object detection. Each row should contain a 'rois'
+        column with detection boxes and class labels.
+
+    Returns
+    -------
+    tuple
+        A tuple containing (class_names, category_ids) where:
+        - class_names: list of unique class name strings
+        - category_ids: dict mapping class names to their numeric IDs
+    """
+    unique_classes = {}
+
+    # Iterate through all rows in the dataframe
+    for idx in range(data.shape[0]):
+        row = data.iloc[idx]
+        rois = row["rois"]
+
+        # Process each ROI in the current row
+        for roi in rois:
+            # Unpack ROI values (assuming last element is class label)
+            *_, class_label = roi
+
+            # Add new classes to the dictionary with auto-incrementing IDs
+            if class_label not in unique_classes:
+                # Start IDs from 1, as 0 is often reserved for background
+                unique_classes[class_label] = len(unique_classes) + 1
+
+    # Create the output lists/dicts
+    class_names = list(unique_classes.keys())
+    category_ids = unique_classes
+
+    return class_names, category_ids
+
+
+def object_detection_df_to_coco(data: pd.DataFrame, save_path: Optional[str] = None):
+    """
+    If the user already has dataframe format data and wants to convert to coco format .json files, this function
+    completes the task
+    Parameters
+    ----------
+    data
+        pd.DataFrame format of object detection data
+    save_path
+        str path to save the output
+    Returns
+    -------
+        Dict
+    """
+    output_json_dict = {"images": [], "type": "instances", "annotations": [], "categories": []}
+    bbox_count = 0
+    unique_classes = {}
+    for idx in range(data.shape[0]):
+        row = data.iloc[idx]
+        image_path = row["image"]
+        rois = row["rois"]
+        # label = row["label"]
+        image_id = idx
+
+        image_info = _get_image_info(image_path)
+        if image_info:
+            image_entry = {
+                "file_name": image_path,
+                "height": image_info["height"],
+                "width": image_info["width"],
+                "id": image_id,
+            }
+            output_json_dict["images"].append(image_entry)
+        else:
+            continue
+
+        for roi in rois:
+            xmin, ymin, xmax, ymax, class_label = roi
+            x, y, w, h = bbox_xyxy_to_xywh([xmin, ymin, xmax, ymax])
+
+            ann = {
+                "area": w * h,
+                "iscrowd": 0,
+                "bbox": [x, y, w, h],
+                "category_id": class_label,
+                "ignore": 0,
+                "segmentation": [],  # This script is not for segmentation
+                "image_id": image_id,
+                "id": bbox_count,
+            }
+            bbox_count += 1
+
+            output_json_dict["annotations"].append(ann)
+
+            if class_label not in unique_classes:
+                unique_classes[class_label] = len(unique_classes)
+
+    for class_name, id in unique_classes.items():
+        output_json_dict["categories"].append({"supercategory": "none", "id": id, "name": class_name})
+
+    if save_path and save_path.endswith(".json"):
+        with open(save_path, "w") as fp:
+            json.dump(output_json_dict, fp)
+
+    return output_json_dict
+
+
+def object_detection_data_to_df(
+    data: Union[pd.DataFrame, dict, list, str], coco_root: Optional[str] = None
+) -> pd.DataFrame:
+    """
+    Construct a dataframe from a data dictionary, json file path (for COCO), folder path (for VOC),
+    image path (for single image), list of image paths (for multiple images)
+    Parameters
+    ----------
+    data (dict, str, list)
+
+    Returns
+    -------
+    a pandas DataFrame with columns "image", "rois", and "label".
+    """
+    if isinstance(data, dict):
+        return from_dict(data)
+    if isinstance(data, list):
+        return from_list(data)
+    if isinstance(data, str):
+        if os.path.isdir(data) or data.endswith(".json"):
+            return from_coco_or_voc(data, coco_root=coco_root)
+        return from_str(data)
+    if isinstance(data, pd.DataFrame):
+        sanity_check_dataframe(data)
+        return data
+
+    raise TypeError(
+        "Expected data to be an instance of dict, list, str or pd.DataFrame, but got {} of type {}".format(
+            data, type(data)
+        )
+    )
+
+
+def sanity_check_dataframe(data: pd.DataFrame):
+    """
+    Checking if the dataframe contains valid headers and values
+    Parameters
+    ----------
+    data
+        dataframe holding the data for object detection
+    Returns
+    -------
+
+    """
+    if "image" not in data:
+        raise ValueError(f"column 'image' not found in data column names: {data.columns.to_list()}")
+    if "rois" not in data and "label" not in data:
+        raise ValueError(f"Both column 'rois' and 'label' not found in data column names: {data.columns.to_list()}")
+    else:
+        if "rois" not in data:
+            warnings.warn(
+                f"column 'rois' not found in data column names: {data.columns.to_list()}. Copying from 'label' column..."
+            )
+            data["rois"] = data["label"]
+        if "label" not in data:
+            warnings.warn(
+                f"column 'label' not found in data column names: {data.columns.to_list()}. Copying from 'rois' column..."
+            )
+            data["label"] = data["rois"]
+    assert data.shape[0] > 0, "data frame is empty"
+
+
+def from_str(data: str) -> pd.DataFrame:
+    """
+    Construct a dataframe a string representing a single image path
+    Parameters
+    ----------
+    data
+        string of the image path
+    Returns
+    -------
+    a pandas DataFrame with columns "image", "rois", and "label".
+    """
+    d = {"image": [], "rois": [], "label": []}
+    d["image"].append(data)
+    # Dummy rois
+    d["rois"].append([[-1, -1, -1, -1, 0]])
+    d["label"].append([[-1, -1, -1, -1, 0]])
+    df = pd.DataFrame(d)
+    return df.sort_values("image").reset_index(drop=True)
+
+
+def from_list(data: List[str]) -> pd.DataFrame:
+    """
+    Construct a dataframe from list of image paths
+    Parameters
+    ----------
+    data
+        List containing the image paths
+    Returns
+    -------
+    a pandas DataFrame with columns "image", "rois", and "label".
+    """
+    d = {"image": [], "rois": [], "label": []}
+    for image_name in data:
+        d["image"].append(image_name)
+        # Dummy rois
+        d["rois"].append([[-1, -1, -1, -1, 0]])
+        d["label"].append([[-1, -1, -1, -1, 0]])
+    df = pd.DataFrame(d)
+    return df.sort_values("image").reset_index(drop=True)
+
+
+def from_dict(data: dict) -> pd.DataFrame:
+    """
+    Construct a dataframe (dummy) from a data dictionary, with the form {"image": ["img1.jpg", "img2.jpg", ...]}
+    Parameters
+    ----------
+    data
+        Dict containing the image paths
+    Returns
+    -------
+    a pandas DataFrame with columns "image", "rois", and "label".
+    """
+    # TODO: Remove this function after refactoring
+    d = {"image": [], "rois": [], "label": []}
+
+    for image in data["image"]:
+        d["image"].append(image)
+        # Dummy rois
+        d["rois"].append([[-1, -1, -1, -1, 0]])
+        d["label"].append([[-1, -1, -1, -1, 0]])
+    df = pd.DataFrame(d)
+    return df.sort_values("image").reset_index(drop=True)
 
 
 def from_voc(
@@ -47,7 +324,12 @@ def from_voc(
         root = download(root)
     rpath = Path(root).expanduser()
     img_list = []
-    class_names = set()
+
+    class_names, _ = get_detection_classes(root)
+
+    NAME_TO_IDX = dict(zip(class_names, range(len(class_names))))
+    name_to_index = lambda name: NAME_TO_IDX[name]
+
     if splits:
         logger.debug("Use splits: %s for root: %s", str(splits), root)
         if isinstance(splits, str):
@@ -68,8 +350,8 @@ def from_voc(
             exts = [exts]
         for ext in exts:
             img_list.extend([rp.stem for rp in rpath.glob("JPEGImages/*" + ext)])
-    print(len(img_list))
     d = {"image": [], "rois": []}
+    logger.info(f"Number of Images: {len(img_list)}")
     for stem in img_list:
         basename = stem + ".xml"
         anno_file = (rpath / "Annotations" / basename).resolve()
@@ -77,11 +359,13 @@ def from_voc(
         xml_root = tree.getroot()
         size = xml_root.find("size")
         im_path = xml_root.find("filename").text
+        if "." not in im_path:
+            im_path += ".jpg"
         width = float(size.find("width").text)
         height = float(size.find("height").text)
         rois = []
         for obj in xml_root.iter("object"):
-            class_label = VOCName2Idx(obj.find("name").text.strip().lower())
+            class_label = name_to_index(obj.find("name").text.strip().lower())
             xml_box = obj.find("bndbox")
             xmin = max(0, float(xml_box.find("xmin").text) - 1)
             ymin = max(0, float(xml_box.find("ymin").text) - 1)
@@ -103,6 +387,8 @@ def from_voc(
             d["image"].append(str(rpath / "JPEGImages" / im_path))
             d["rois"].append(rois)
     df = pd.DataFrame(d)
+    df["label"] = df.loc[:, "rois"].copy()  # TODO: remove duplicate column
+
     return df.sort_values("image").reset_index(drop=True)
 
 
@@ -218,6 +504,83 @@ def bbox_xywh_to_xyxy(xywh: Optional[Union[list, tuple, np.ndarray]]):
         raise TypeError("Expect input xywh a list, tuple or numpy.ndarray, given {}".format(type(xywh)))
 
 
+def bbox_ratio_xywh_to_index_xyxy(
+    xywh: Optional[Union[list, tuple, np.ndarray]], image_wh: Optional[Union[list, tuple, np.ndarray]]
+):
+    """
+    Convert bounding boxes from format (x_center_ratio, y_center_ratio, w_ratio, h_ratio) to (xmin, ymin, xmax, ymax) in pixel index.
+
+    Parameters
+    ----------
+    xywh
+        The bbox in format (x_center_ratio, y_center_ratio, w_ratio, h_ratio).
+        If numpy.ndarray is provided, we expect multiple bounding boxes with
+        shape `(N, 4)`.
+
+    Returns
+    -------
+    A tuple or numpy.ndarray.
+    The converted bboxes in format (xmin, ymin, xmax, ymax).
+    If input is numpy.ndarray, return is numpy.ndarray correspondingly.
+    """
+    if isinstance(xywh, (tuple, list)):
+        assert isinstance(
+            image_wh, (tuple, list)
+        ), f"image_wh (type: {type(image_wh)} should have the same type with xywh (type: {type(xywh)})"
+
+        if not len(xywh) == 4:
+            raise IndexError("Bounding boxes must have 4 elements, given {}".format(len(xywh)))
+        if not len(image_wh) == 2:
+            raise IndexError("Image Width and Height must have 2 elements, given {}".format(len(image_wh)))
+
+        x, y = xywh[:2]
+        w, h = np.maximum(xywh[2] - 1, 0), np.maximum(xywh[3] - 1, 0)
+        W, H = np.maximum(image_wh[0] - 1, 0), np.maximum(image_wh[1] - 1, 0)
+
+        # ratio to index
+        x *= W
+        y *= H
+        W *= W
+        H *= H
+
+        # mid to upper left corner
+        x -= W / 2
+        y -= H / 2
+
+        return x, y, x + w, y + h  # xywh to xyxy
+    elif isinstance(xywh, np.ndarray):
+        if isinstance(image_wh, np.ndarray):
+            if not xywh.size % 4 == 0:
+                raise IndexError("Bounding boxes must have n * 4 elements, given {}".format(xywh.shape))
+            if not image_wh.size % 2 == 0:
+                raise IndexError("Image Width and Height must have n * 2 elements, given {}".format(image_wh.shape))
+
+            xywh = xywh * np.concat([image_wh, image_wh], axis=1)  # ratio to index
+
+            # mid to upper left corner
+            xywh[:, :2] -= xywh[:, 2:] / 2
+
+            # xywh to xyxy
+            xyxy = np.hstack((xywh[:, :2], xywh[:, :2] + np.maximum(0, xywh[:, 2:] - 1)))
+            return xyxy
+        elif isinstance(image_wh, (tuple, list)):
+            if not xywh.size % 4 == 0:
+                raise IndexError("Bounding boxes must have n * 4 elements, given {}".format(xywh.shape))
+
+            W, H = np.maximum(image_wh[0] - 1, 0), np.maximum(image_wh[1] - 1, 0)
+
+            xywh = xywh * np.array([[W, H, W, H]])  # ratio to index
+
+            # mid to upper left corner
+            xywh[:, :2] -= xywh[:, 2:] / 2
+
+            # xywh to xyxy
+            xyxy = np.hstack((xywh[:, :2], xywh[:, :2] + np.maximum(0, xywh[:, 2:] - 1)))
+            return xyxy
+    else:
+        raise TypeError("Expect input xywh a list, tuple or numpy.ndarray, given {}".format(type(xywh)))
+
+
 def bbox_xyxy_to_xywh(xyxy: Optional[Union[list, tuple, np.ndarray]]):
     """
     Convert bounding boxes from format (xmin, ymin, xmax, ymax) to (x, y, w, h). Modified from gluon cv.
@@ -300,7 +663,6 @@ def _check_load_coco_bbox(
     entry: dict,
     min_object_area: Optional[Union[int, float]] = 0,
     use_crowd: Optional[bool] = False,
-    is_voc: Optional[bool] = False,
 ):
     """
     Check and load ground-truth labels. Modified from gluon cv.
@@ -342,12 +704,9 @@ def _check_load_coco_bbox(
         xmin, ymin, xmax, ymax = bbox_clip_xyxy(bbox_xywh_to_xyxy(obj["bbox"]), width, height)
         # require non-zero box area
         if obj["area"] > 0 and xmax > xmin and ymax > ymin:
-            # TODO: remove hardcoding here
-            class_label = (
-                coco.loadCats(obj["category_id"])[0]["id"]
-                if is_voc
-                else COCOId2Idx(coco.loadCats(obj["category_id"])[0]["id"])
-            )
+            cat_ids = coco.getCatIds()
+            id_to_idx = dict(zip(cat_ids, range(len(cat_ids))))
+            class_label = id_to_idx[coco.loadCats(obj["category_id"])[0]["id"]]
             rois.append(
                 [
                     float(xmin),
@@ -363,7 +722,7 @@ def _check_load_coco_bbox(
 
 def from_coco(
     anno_file: Optional[str],
-    root: Optional[str] = None,
+    coco_root: Optional[str] = None,
     min_object_area: Optional[Union[int, float]] = 0,
     use_crowd: Optional[bool] = False,
 ):
@@ -381,7 +740,7 @@ def from_coco(
     ----------
     anno_file
         The path to the annotation file.
-    root
+    coco_root
         Root of the COCO folder. The default relative root folder (if set to `None`) is `anno_file/../`.
     min_object_area
         Minimum object area to consider.
@@ -392,7 +751,7 @@ def from_coco(
     -------
     A dataframe with columns "image", "rois", and "image_attr".
     """
-    # construct from COCO format
+    # construct coco object from COCO format
     try_import_pycocotools()
     from pycocotools.coco import COCO
 
@@ -402,181 +761,222 @@ def from_coco(
         anno_file = os.path.expanduser(anno_file)
     coco = COCO(anno_file)
 
-    is_voc = "voc" in anno_file
-
-    if isinstance(root, Path):
-        root = str(root.expanduser().resolve())
-    elif isinstance(root, str):
-        root = os.path.abspath(os.path.expanduser(root))
-    elif root is None:
+    # get data root
+    if isinstance(coco_root, Path):
+        coco_root = str(coco_root.expanduser().resolve())
+    elif isinstance(coco_root, str):
+        coco_root = os.path.abspath(os.path.expanduser(coco_root))
+    elif coco_root is None:
         # try to use the default coco structure
-        root = os.path.join(os.path.dirname(anno_file), "..")
-        logger.info("Using default root folder: %s. Specify `root=...` if you feel it is wrong...", root)
+        coco_root = os.path.join(os.path.dirname(anno_file), "..")
+        logger.info(
+            f"Using default root folder: {coco_root}. "
+            "Specify `model.mmdet_image.coco_root=...` in hyperparameters if you think it is wrong."
+        )
     else:
-        raise ValueError("Unable to parse root: {}".format(root))
+        raise ValueError("Unable to parse coco_root: {}".format(coco_root))
 
-    # synsets
-    classes = [c["name"] for c in coco.loadCats(coco.getCatIds())]
+    # support prediction using data with no annotations
+    # note that data with annotation can be used for prediction without any changes
+    try:
+        num_annotations = len(coco.getAnnIds())
+    except KeyError:  # KeyError: 'annotations', there is no annotation entry
+        num_annotations = 0
+
     # load entries
     d = {"image": [], "rois": []}
     image_ids = sorted(coco.getImgIds())
     for entry in coco.loadImgs(image_ids):
         if "coco_url" in entry:
             dirname, filename = entry["coco_url"].split("/")[-2:]
-            abs_path = os.path.join(root, dirname, filename)
+            abs_path = os.path.join(coco_root, dirname, filename)
         else:
-            abs_path = os.path.join(root, entry["file_name"])
+            abs_path = os.path.join(coco_root, entry["file_name"])
         if not os.path.exists(abs_path):
-            raise IOError("Image: {} not exists.".format(abs_path))
+            logger.warning(f"File skipped since not exists: {abs_path}.")
+            continue
         rois, _ = _check_load_coco_bbox(
-            coco, entry, min_object_area=min_object_area, use_crowd=use_crowd, is_voc=is_voc
+            coco,
+            entry,
+            min_object_area=min_object_area,
+            use_crowd=use_crowd,
         )
         if not rois:
+            # discard the rows without valid annotation ONLY when data has annotation
+            # add default placeholder to data without annotation for prediction
+            if not num_annotations:
+                d["image"].append(abs_path)
+                d["rois"].append([[-1, -1, -1, -1, 0]])  # TODO: maybe remove this placeholder
             continue
         d["image"].append(abs_path)
         d["rois"].append(rois)
     df = pd.DataFrame(d)
-    df["rois_label"] = df.loc[:, "rois"].copy()
+    df["label"] = df.loc[:, "rois"].copy()
     return df.sort_values("image").reset_index(drop=True)
 
 
-def getCOCOCatIDs(is_voc=False):
-    if is_voc:
-        return range(20)
-    else:
-        return [e for e in range(1, 91) if e not in {12, 26, 29, 30, 45, 66, 68, 69, 71, 83}]
+def get_image_filename(path: str):
+    """
+    Get the filename (without extension) from its path.
 
+    Parameters
+    ----------
+    path
+        The path of image.
 
-COCO_ID_TO_IDX = dict(zip(getCOCOCatIDs(), range(80)))
-
-
-def COCOId2Idx(id):
-    return COCO_ID_TO_IDX[id]
-
-
-VOC_CLASSES = [
-    "aeroplane",
-    "bicycle",
-    "bird",
-    "boat",
-    "bottle",
-    "bus",
-    "car",
-    "cat",
-    "chair",
-    "cow",
-    "diningtable",
-    "dog",
-    "horse",
-    "motorbike",
-    "person",
-    "pottedplant",
-    "sheep",
-    "sofa",
-    "train",
-    "tvmonitor",
-]
-
-VOC_NAME_TO_IDX = dict(zip(VOC_CLASSES, range(20)))
-
-
-def VOCName2Idx(name):
-    return VOC_NAME_TO_IDX[name]
-
-
-def get_image_name_num(path):
-    start_idx = path.rfind("/") + 1
-    end_idx = path.rindex(".")
-    return int(path[start_idx:end_idx])
+    Returns
+    -------
+    The file name of image.
+    """
+    return Path(path.replace("\\", "/")).stem
 
 
 class COCODataset:
-    def __init__(self, anno_file):
+    # The class that load/save COCO data format.
+    # TODO: refactor data loading into here
+    def __init__(self, anno_file: str, category_ids: Optional[List] = None):
+        """
+        Parameters
+        ----------
+        anno_file
+            The path to COCO format json annotation file.
+        """
         self.anno_file = anno_file
-        self.is_voc = "voc" in anno_file
 
         with open(anno_file, "r") as f:
             d = json.load(f)
         image_list = d["images"]
-        img_namenum_list = []
+        img_filename_list = []
         img_id_list = []
         for img in image_list:
-            img_namenum_list.append(get_image_name_num(img["file_name"]))
+            img_filename_list.append(get_image_filename(img["file_name"]))
             img_id_list.append(int(img["id"]))
-        self.image_namenum_to_id = dict(zip(img_namenum_list, img_id_list))
+        self.image_filename_to_id = dict(zip(img_filename_list, img_id_list))
 
-        self.category_ids = [cat["id"] for cat in d["categories"]]
+        if category_ids is None:
+            if "categories" in d:
+                self.category_ids = [cat["id"] for cat in d["categories"]]
+            else:
+                self.category_ids = range(9999)  # TODO: remove hardcoding here
+        else:
+            self.category_ids = category_ids
 
-    def get_image_id_from_path(self, image_path):
-        return self.image_namenum_to_id[get_image_name_num(image_path)]
+    def get_image_id_from_path(self, image_path: str):
+        """
+        Get image id from its path.
 
-    def save_result(self, ret, data, save_path):
+        Parameters
+        ----------
+        image_path
+            Image path.
+
+        Returns
+        -------
+        Image ID.
+        """
+        return self.image_filename_to_id[get_image_filename(image_path)]
+
+    def save_result(self, ret: List, data: pd.DataFrame, save_path: str):
+        """
+        Save COCO format result to given save path.
+
+        Parameters
+        ----------
+        ret
+            The returned prediction result.
+        data
+            The input data.
+        save_path
+            The save path given to store COCO format output.
+        """
         coco_format_result = []
 
         for i, row in data.reset_index(drop=True).iterrows():
             image_id = self.get_image_id_from_path(row["image"])
-            for j, res in enumerate(ret[i]):
-                category_id = self.category_ids[j]
-                for bbox in res:
-                    coco_format_result.append(
-                        {
-                            "image_id": image_id,
-                            "category_id": category_id,
-                            "bbox": bbox_xyxy_to_xywh(bbox[:4].astype(float).tolist()),
-                            "score": float(bbox[4]),
-                        }
-                    )
+
+            pred_result = ret[i]
+            N_pred = len(pred_result["bboxes"])
+            for bbox_idx in range(N_pred):
+                coco_format_result.append(
+                    {
+                        "image_id": image_id,
+                        "category_id": self.category_ids[int(pred_result["labels"][bbox_idx].item())],
+                        "bbox": bbox_xyxy_to_xywh(pred_result["bboxes"][bbox_idx].tolist()),
+                        "score": pred_result["scores"][bbox_idx].item(),
+                    }
+                )
+
         with open(save_path, "w") as f:
             print(f"saving file at {save_path}")
             json.dump(coco_format_result, f)
 
 
-def cocoeval_torchmetrics(outputs):
-    import torch
+def cocoeval_torchmetrics(outputs: List):
+    """
+    Evaluate predictor's output using torchmetrics' mAP implementation: https://github.com/Lightning-AI/metrics
 
-    from . import MeanAveragePrecision
+    Parameters
+    ----------
+    outputs
+        The predictor's output. It is a list with length equals number of images.
+
+    Returns
+    -------
+    The mAP result.
+    """
 
     map_metric = MeanAveragePrecision(box_format="xyxy", iou_type="bbox", class_metrics=False)
-    for output in outputs:  # TODO: refactor here
-        pred_results = output["bbox"]
-        preds = []
-        for img_idx, img_result in enumerate(pred_results):
-            img_result = img_result
-            boxes = []
-            scores = []
-            labels = []
-            for category_idx, category_result in enumerate(img_result):
-                for item_idx, item_result in enumerate(category_result):
-                    boxes.append(item_result[:4])
-                    scores.append(float(item_result[4]))
-                    labels.append(category_idx)
-            preds.append(
-                dict(
-                    boxes=torch.tensor(np.array(boxes).astype(float)).float().to("cpu"),
-                    scores=torch.tensor(scores).float().to("cpu"),
-                    labels=torch.tensor(labels).long().to("cpu"),
-                )
-            )
 
-        target = []
-        gts = output["label"]
-        for gt in gts:
-            img_gt = np.array(gt)
-            boxes = img_gt[:, :4]
-            labels = img_gt[:, 4]
-            target.append(
-                dict(
-                    boxes=torch.tensor(boxes).float().to("cpu"),
-                    labels=torch.tensor(labels).long().to("cpu"),
-                )
+    preds = []
+    target = []
+    for per_img_outputs in outputs:  # TODO: refactor here
+        preds.append(
+            dict(
+                boxes=per_img_outputs[BBOX]["bboxes"].to("cpu"),
+                scores=per_img_outputs[BBOX]["scores"].to("cpu"),
+                labels=per_img_outputs[BBOX]["labels"].to("cpu"),
             )
+        )
 
-        map_metric.update(preds, target)
+        target.append(
+            dict(
+                boxes=per_img_outputs[LABEL]["bboxes"].to("cpu"),
+                labels=per_img_outputs[LABEL]["labels"].to("cpu"),
+            )
+        )
+
+    map_metric.update(preds, target)
 
     return map_metric.compute()
 
 
-def cocoeval_pycocotools(outputs, data, anno_file, cache_path, metrics):
+def cocoeval_pycocotools(
+    outputs: List,
+    data: pd.DataFrame,
+    anno_file: str,
+    cache_path: str,
+):
+    """
+    Evaluate predictor's output using pycocotool's mAP implementation: https://github.com/cocodataset/cocoapi
+    Pycocotool's implementation takes COCO format prediction result file as input.
+    So here requires a cache_path to store the prediction result file.
+
+    Parameters
+    ----------
+    outputs
+        The predictor's output. It is a list with length equals number of images.
+    data
+        The input data.
+    anno_file
+        The path to COCO format json annotation file.
+    cache_path
+        The cache path to store prediction result in COCO format.
+
+    Returns
+    -------
+    The mAP result.
+    """
+    try_import_pycocotools()
     from pycocotools.coco import COCO
     from pycocotools.cocoeval import COCOeval
 
@@ -598,14 +998,649 @@ def cocoeval_pycocotools(outputs, data, anno_file, cache_path, metrics):
     cocoEval.accumulate()
     cocoEval.summarize()
 
-    if isinstance(metrics, list):
-        metrics = metrics[0]
-
-    return {metrics: cocoEval.stats[0]}
+    return cocoEval.stats
 
 
-def cocoeval(outputs, data, anno_file, cache_path, metrics, tool="pycocotools"):
-    if tool == "pycocotools":
-        return cocoeval_pycocotools(outputs, data, anno_file, cache_path, metrics)
+def parse_detection_result(
+    result: Optional[Union[Dict, np.ndarray]],
+):
+    if isinstance(result, np.ndarray):
+        return {
+            MAP: result[0],
+            MEAN_AVERAGE_PRECISION: result[0],
+            MAP_50: result[1],
+            MAP_75: result[2],
+            MAP_SMALL: result[3],
+            MAP_MEDIUM: result[4],
+            MAP_LARGE: result[5],
+            MAR_1: result[6],
+            MAR_10: result[7],
+            MAR_100: result[8],
+            MAR_SMALL: result[9],
+            MAR_MEDIUM: result[10],
+            MAR_LARGE: result[11],
+        }
+    else:
+        result[MEAN_AVERAGE_PRECISION] = result[MAP]
+        return result
+
+
+def cocoeval(
+    outputs: List,
+    data: pd.DataFrame,
+    anno_file: str,
+    cache_path: str,
+    metrics: Optional[Union[str, List]],
+    tool="pycocotools",
+):
+    """
+    Evaluate predictor's output using mAP metrics per COCO's standard.
+
+    Parameters
+    ----------
+    outputs
+        The predictor's output. It is a list with length equals number of images.
+    data
+        The input data.
+    anno_file
+        The path to COCO format json annotation file.
+    cache_path
+        The cache path to store prediction result in COCO format.
+    metrics
+        The name of metrics to be reported.
+    tool
+        Use the mAP implementation of "pycocotools" or "torchmetrics".
+
+    Returns
+    -------
+    The mAP result.
+    """
+    if (not tool) or tool == "pycocotools":
+        result = cocoeval_pycocotools(outputs, data, anno_file, cache_path)
     elif tool == "torchmetrics":
-        return cocoeval_torchmetrics(outputs)
+        result = cocoeval_torchmetrics(outputs)
+    else:
+        raise ValueError(f"Unsupported eval_tool: {tool}")
+
+    result = parse_detection_result(result)
+
+    if metrics:
+        if isinstance(metrics, str) and metrics.lower() in result:
+            return {metrics.lower(): result[metrics.lower()]}
+        elif isinstance(metrics, list):
+            return {metric.lower(): result[metric.lower()] for metric in metrics}
+
+    return result
+
+
+def dump_voc_classes(voc_annotation_path: str, voc_class_names_output_path: str = None) -> [str]:
+    """
+    Reads annotations for a dataset in VOC format.
+    Then
+        dumps the unique class names into a labels.txt file.
+    Parameters
+    ----------
+    voc_annotation_path
+        root_path for annotations in VOC format
+    voc_class_names_output_path
+        output path for the labels.txt
+    Returns
+    -------
+    list of strings, [class_name0, class_name1, ...]
+    """
+    files = os.listdir(voc_annotation_path)
+    class_names = set()
+    for f in files:
+        if f.endswith(".xml"):
+            xml_path = os.path.join(voc_annotation_path, f)
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+            for boxes in root.iter("object"):
+                class_names.add(boxes.find("name").text)
+
+    sorted_class_names = sorted(list(class_names))
+    if voc_class_names_output_path:
+        with open(voc_class_names_output_path, "w") as f:
+            f.writelines("\n".join(sorted_class_names))
+
+    return sorted_class_names
+
+
+def dump_voc_xml_files(voc_annotation_path: str, voc_annotation_xml_output_path: str = None) -> [str]:
+    """
+    Reads annotations for a dataset in VOC format.
+    Then
+        1. dumps the unique class names into labels.txt file.
+        2. dumps the xml annotation file names into pathlist.txt file.
+    Parameters
+    ----------
+    voc_annotation_path
+        root_path for annotations in VOC format
+    voc_annotation_xml_output_path
+        output path for the pathlist.txt
+    Returns
+    -------
+        list of strings, [xml_file0, xml_file1, ...]
+    """
+    files = os.listdir(voc_annotation_path)
+    annotation_path_base_name = os.path.basename(voc_annotation_path)
+    xml_file_names = []
+    for f in files:
+        if f.endswith(".xml"):
+            xml_file_names.append(os.path.join(annotation_path_base_name, f))
+
+    if voc_annotation_xml_output_path:
+        with open(voc_annotation_xml_output_path, "w") as f:
+            f.writelines("\n".join(xml_file_names))
+
+    return xml_file_names
+
+
+def process_voc_annotations(
+    voc_annotation_path: str, voc_class_names_output_path: str, voc_annotation_xml_output_path: str
+) -> None:
+    """
+    Reads annotations for a dataset in VOC format.
+    Then
+        1. dumps the unique class names into labels.txt file.
+        2. dumps the xml annotation file names into pathlist.txt file.
+    Parameters
+    ----------
+    voc_annotation_path
+        root_path for annotations in VOC format
+    voc_class_names_output_path
+        output path for the labels.txt
+    voc_annotation_xml_output_path
+        output path for the pathlist.txt
+    Returns
+    -------
+        None
+    """
+    files = os.listdir(voc_annotation_path)
+    annotation_path_base_name = os.path.basename(voc_annotation_path)
+    class_names = set()
+    xml_file_names = []
+    for f in files:
+        xml_path = os.path.join(voc_annotation_path, f)
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        for boxes in root.iter("object"):
+            class_names.add(boxes.find("name").text)
+
+        xml_file_names.append(os.path.join(annotation_path_base_name, f))
+
+    sorted_class_names = sorted(list(class_names))
+    with open(voc_class_names_output_path, "w") as f:
+        f.writelines("\n".join(sorted_class_names))
+
+    with open(voc_annotation_xml_output_path, "w") as f:
+        f.writelines("\n".join(xml_file_names))
+
+
+def from_coco_or_voc(file_path: str, splits: Optional[Union[str]] = None, coco_root: Optional[str] = None):
+    """
+    Convert the data from coco or voc format to pandas Dataframe.
+
+    Parameters
+    ----------
+    file_path
+        The path to data.
+        If it is a file, it should be the COCO format json annotation file.
+        If it is a directory, it should be the root folder of VOC format data.
+    splits
+        The splits to use for VOC format data.
+
+    Returns
+    -------
+        The data in our pandas Dataframe format.
+    """
+    if os.path.isdir(file_path):
+        # VOC use dir as input
+        return from_voc(root=file_path, splits=splits)
+    else:
+        return from_coco(file_path, coco_root=coco_root)
+
+
+def get_coco_format_classes(sample_data_path: str):
+    """
+    Get class names and category IDs for COCO format data.
+
+    Parameters
+    ----------
+    sample_data_path : str
+        The path to COCO format json annotation file. Could be any split, e.g. train/val/test/....
+
+    Returns
+    -------
+    tuple
+        A tuple containing (class_names, category_ids) where:
+        - class_names: list of class name strings
+        - category_ids: dict mapping class names to their COCO category IDs
+    """
+    try:
+        with open(sample_data_path, "r") as f:
+            annotation = json.load(f)
+    except:
+        raise ValueError(f"Failed to load json from provided json file: {sample_data_path}.")
+
+    # Extract both names and IDs from categories
+    class_names = [cat["name"] for cat in annotation["categories"]]
+
+    # Create mapping of names to their original COCO category IDs
+    category_ids = [cat["id"] for cat in annotation["categories"]]
+
+    return class_names, category_ids
+
+
+def get_voc_format_classes(root: str):
+    """
+    Get class names and category IDs for VOC format data.
+
+    Parameters
+    ----------
+    root : str
+        The path to the root directory of VOC data.
+
+    Returns
+    -------
+    tuple
+        A tuple containing (class_names, category_ids) where:
+        - class_names: list of class name strings
+        - category_ids: dict mapping class names to their numeric IDs
+    """
+    if is_url(root):
+        root = download(root)
+
+    rpath = Path(root).expanduser()
+    labels_file = os.path.join(rpath, "labels.txt")
+
+    if os.path.exists(labels_file):
+        with open(labels_file) as f:
+            class_names = [line.rstrip().lower() for line in f]
+        print(f"using class_names in labels.txt: {class_names}")
+    else:
+        # read the class names and save results
+        logger.warning(
+            "labels.txt does not exist, using default VOC names. "
+            "Creating labels.txt by scanning the directory: {}".format(os.path.join(root, "Annotations"))
+        )
+        class_names = dump_voc_classes(
+            voc_annotation_path=os.path.join(root, "Annotations"), voc_class_names_output_path=labels_file
+        )
+
+    # There are no category IDs in VOC format
+    # Create category IDs dictionary starting from 1
+    # 0 is typically reserved for background in many frameworks
+    category_ids = [idx + 1 for idx, name in enumerate(class_names)]
+
+    return class_names, category_ids
+
+
+def get_detection_classes(sample_data_path):
+    """
+    Get class names and category IDs from detection dataset in various formats.
+
+    Parameters
+    ----------
+    sample_data_path : Union[str, pd.DataFrame]
+        The input can be one of:
+        - str (directory): Path to root directory of VOC format data
+        - str (file): Path to COCO format JSON annotation file
+        - pd.DataFrame: DataFrame containing detection data with 'rois' column
+
+    Returns
+    -------
+    tuple
+        A tuple containing (class_names, category_ids) where:
+        - class_names: list of class name strings
+        - category_ids: dict mapping class names to their numeric IDs
+
+        For VOC: IDs start from 1
+        For COCO: Original category IDs from annotation file
+        For DataFrame: Sequential IDs starting from 1
+    """
+    # Handle string paths for VOC and COCO formats
+    if isinstance(sample_data_path, str):
+        if os.path.isdir(sample_data_path):
+            # Directory path indicates VOC format
+            return get_voc_format_classes(sample_data_path)
+        else:
+            # File path indicates COCO format JSON
+            return get_coco_format_classes(sample_data_path)
+    # Handle DataFrame format
+    elif isinstance(sample_data_path, pd.DataFrame):
+        return get_df_unique_classes(sample_data_path)
+
+
+def visualize_detection(
+    pred: pd.DataFrame,
+    detection_classes: List[str],
+    conf_threshold: float,
+    visualization_result_dir: str,
+):
+    """
+    Visualize detection results for one image, and save to visualization_result_dir
+
+    Parameters
+    ----------
+    pred
+        Detection results as in pd.DataFrame format
+    detection_classes
+        All classes for detection
+    conf_threshold
+        Bounding box confidence threshold to filter unwanted detections
+    visualization_result_dir
+        Directory to save the visualization results
+    Returns
+    -------
+    an List of np.ndarray of visualized images
+    """
+    try:
+        import cv2
+    except:
+        raise ImportError("No module named: cv2. Please install cv2 by 'pip install opencv-python'")
+
+    if not os.path.exists(visualization_result_dir):
+        os.makedirs(visualization_result_dir, exist_ok=True)
+
+    classname2idx = {classname: i for i, classname in enumerate(detection_classes)}
+    idx2classname = {i: classname for i, classname in enumerate(detection_classes)}
+
+    visualized_images = []
+    for i in range(len(pred)):
+        image_path = pred.iloc[i]["image"]
+        image_pred = pred.iloc[i]["bboxes"]
+        im = cv2.imread(image_path)
+        tlwhs = []
+        obj_ids = []
+        conf_scores = []
+        for data in image_pred:
+            if data["score"] > conf_threshold:
+                obj_ids.append(classname2idx[data["class"]])
+                tlwhs.append(bbox_xyxy_to_xywh(data["bbox"]))
+                conf_scores.append(data["score"])
+        visualized_im = plot_detections(im, tlwhs, obj_ids, idx2classname, conf_threshold, scores=conf_scores)
+        visualized_images.append(visualized_im)
+        imgname = os.path.basename(image_path)
+        cv2.imwrite(os.path.join(visualization_result_dir, imgname), visualized_im)
+    logger.info("Saved visualizations to {}".format(visualization_result_dir))
+    return visualized_images
+
+
+def plot_detections(
+    image,
+    tlwhs,
+    obj_ids,
+    idx2classname,
+    conf_threshold,
+    scores=None,
+    text_scale=0.75,
+    text_thickness=1,
+    line_thickness=2,
+    alpha=0.5,
+):
+    """
+    Plot the detections on to the corresponding image
+
+    Parameters
+    ----------
+    image
+        np.ndarray: np array containing the image data
+    tlwhs
+        list: list containing the bounding boxes in (x1, y1, x2, y2) format
+    obj_ids
+        list: list containing the class indices of the bounding boxes, length should match tlwhs
+    idx2classname
+        dict: maps obj_ids to class name (str)
+    conf_threshold
+        float: confidence threshold to filter bounding boxes
+    scores
+        list: confidence scores of the bounding boxes, length should match tlwhs
+    text_scale
+        float: font size of the text display
+    text_thickness
+        int: font weight of the text display
+    line_thickness
+        int: line width of the bounding box display
+    alpha
+        float: opacity of the text display background color
+
+    Returns
+    -------
+    an np.ndarray of visualized image
+    """
+    # TODO: Convert to use mmdet package
+    try:
+        import cv2
+    except:
+        raise ImportError("No module named: cv2. Please install cv2 by 'pip install opencv-python'")
+    im = np.ascontiguousarray(np.copy(image))
+    im_h, im_w = im.shape[:2]
+
+    font = cv2.FONT_HERSHEY_DUPLEX
+    text_scale = text_scale if im_w > 500 else text_scale * 0.8
+
+    title = "num_det: %d conf: %.2f" % (len(tlwhs), conf_threshold)
+    im = add_text_with_bg_color(
+        im=im,
+        text=title,
+        tl=(0, 0),
+        bg_color=(0, 0, 0),
+        alpha=alpha,
+        font=font,
+        text_scale=text_scale,
+        text_thickness=text_thickness,
+    )
+
+    for i, tlwh in enumerate(tlwhs):
+        x1, y1, w, h = tlwh
+        intbox = tuple(map(int, (x1, y1, x1 + w, y1 + h)))
+        obj_id = int(obj_ids[i])
+        id_text = idx2classname[obj_ids[i]]
+        if scores is not None:
+            id_text = id_text + ",{:.3f}".format(float(scores[i]))
+        color = get_color(abs(obj_id))
+        im = add_bbox_with_alpha(
+            im=im, tl=intbox[0:2], br=intbox[2:4], line_color=color, alpha=alpha, line_thickness=line_thickness
+        )
+        im = add_text_with_bg_color(
+            im=im,
+            text=id_text,
+            tl=(intbox[0], intbox[1]),
+            bg_color=color,
+            alpha=0.75,
+            font=font,
+            text_scale=text_scale,
+            text_thickness=text_thickness,
+        )
+    return im
+
+
+def add_bbox_with_alpha(im: np.ndarray, tl: tuple, br: tuple, line_color: tuple, alpha: float, line_thickness: int):
+    """
+    draw one box borders with transparency (alpha)
+
+    Parameters
+    ----------
+    im
+        np.ndarray: the image to draw bbox on
+    tl
+        tuple: bottom right corner of the bounding box: tl = (x1, y1)
+    br
+        tuple: bottom right corner of the bounding box: br = (x1, y1)
+    line_color
+        tuple: the color of the box borders, e.g. (0, 0, 0)
+    alpha
+        float: the opacity of the bbox borders
+    line_thickness:
+        int: thickness of the border
+    Returns
+    -------
+    an np.ndarray of image with added bbox
+    """
+    try:
+        import cv2
+    except:
+        raise ImportError("No module named: cv2. Please install cv2 by 'pip install opencv-python'")
+    overlay = im.copy()
+    cv2.rectangle(overlay, tl, br, line_color, thickness=line_thickness)
+    im = cv2.addWeighted(overlay, alpha, im, 1 - alpha, 0)
+    return im
+
+
+def add_text_with_bg_color(
+    im: np.ndarray,
+    text: str,
+    tl: tuple,
+    bg_color: tuple,
+    alpha: float,
+    font,
+    text_scale: float,
+    text_thickness: int,
+    text_vert_padding: int = None,
+):
+    """
+    Add text to im with background color
+
+    Parameters
+    ----------
+    im
+        np.ndarray: the image to add text on
+    text
+        string: the text content
+    tl
+        tuple: top left corner of the text region, tl = (x1, y1)
+    bg_color
+        tuple: the color of the background, e.g. (0, 0, 0)
+    alpha
+        float: the opacity of the background
+    font
+        the font of the text, e.g. cv2.FONT_HERSHEY_DUPLEX
+    text_scale
+        float: the scale (font size) of the text, e.g. 0.75
+    text_thickness
+        int: the font weight of the text, e.g. 1
+    text_vert_padding
+        int: vertical padding of the text on each side
+    Returns
+    -------
+    an np.ndarray of image with added text
+    """
+    try:
+        import cv2
+    except:
+        raise ImportError("No module named: cv2. Please install cv2 by 'pip install opencv-python'")
+
+    x1, y1 = tl
+
+    overlay = im.copy()
+    text_size, _ = cv2.getTextSize(text, font, float(text_scale), text_thickness)
+    text_w, text_h = text_size
+
+    text_vert_padding = text_vert_padding if text_vert_padding else int(text_h * 0.1)
+
+    y1 = max(y1 - text_h - text_vert_padding * 2, 0)
+
+    cv2.rectangle(overlay, (x1, y1), (x1 + text_w, y1 + text_h + text_vert_padding * 2), bg_color, -1)
+    im = cv2.addWeighted(overlay, alpha, im, 1 - alpha, 0)
+    cv2.putText(
+        im, text, (x1, y1 + text_h + text_vert_padding), font, text_scale, (255, 255, 255), thickness=text_thickness
+    )
+    return im
+
+
+def get_color(idx):
+    idx = idx * 3
+    color = ((37 * idx) % 255, (17 * idx) % 255, (29 * idx) % 255)
+    return color
+
+
+def convert_result_df(
+    pred: Iterable, data: Union[pd.DataFrame, Dict], detection_classes: List[str], result_path: Optional[str] = None
+):
+    """
+    Saving detection results in pd.DataFrame format (per image)
+
+    Parameters
+    ----------
+    pred
+        List containing detection results for one image
+    data
+        pandas data frame or dict containing the image information to be tested
+    result_path
+        path to save result
+    detection_classes
+        all available classes for this detection
+    Returns
+    -------
+    The detection results as pandas DataFrame
+    """
+    if isinstance(data, dict):
+        image_names = data["image"]
+    else:
+        image_names = data["image"].to_list()
+    results = []
+    idx2classname = {i: classname for (i, classname) in enumerate(detection_classes)}
+
+    for image_pred, image_name in zip(pred, image_names):
+        box_info = []
+        N_preds = len(image_pred["bboxes"])
+        for i in range(N_preds):
+            box_info.append(
+                {
+                    "class": idx2classname[image_pred["labels"][i].item()],
+                    "class_id": image_pred["labels"][i].item(),
+                    "bbox": image_pred["bboxes"][i].tolist(),
+                    "score": image_pred["scores"][i].item(),
+                }
+            )
+        results.append([image_name, box_info])
+    result_df = pd.DataFrame(results, columns=["image", "bboxes"])
+    if result_path:
+        result_df.to_csv(result_path, index=False)
+        logger.info("Saved detection results to {}".format(result_path))
+    return result_df
+
+
+def save_result_coco_format(data_path, pred, category_ids, result_path, coco_root: Optional[str] = None):
+    coco_dataset = COCODataset(data_path, category_ids=category_ids)
+    result_name, _ = os.path.splitext(result_path)
+    result_path = result_name + ".json"
+    coco_dataset.save_result(pred, from_coco_or_voc(data_path, "test", coco_root=coco_root), save_path=result_path)
+    logger.info(25, f"Saved detection result to {result_path}")
+
+
+def save_result_voc_format(pred, result_path):
+    result_name, _ = os.path.splitext(result_path)
+    result_path = result_name + ".npy"
+    np.save(result_path, pred)
+    logger.info(25, f"Saved detection result to {result_path}")
+
+
+def convert_pred_to_xywh(pred: Optional[List]) -> Optional[List]:
+    """
+    Convert prediction bounding boxes from XYXY to XYWH format.
+
+    Args:
+        pred: List of predictions, where each prediction contains 'bboxes' that can be
+             either a torch.Tensor or numpy.ndarray
+
+    Returns:
+        Modified list of predictions with bboxes in XYWH format
+    """
+    if not pred:
+        return pred
+
+    for i, pred_per_image in enumerate(pred):
+        bboxes = pred_per_image["bboxes"]
+
+        # Handle numpy array case
+        if isinstance(bboxes, np.ndarray):
+            pred[i]["bboxes"] = bbox_xyxy_to_xywh(bboxes)
+        # Handle torch.Tensor case
+        elif torch.is_tensor(bboxes):
+            pred[i]["bboxes"] = bbox_xyxy_to_xywh(bboxes.detach().numpy())
+        else:
+            raise TypeError(f"Unsupported bbox type: {type(bboxes)}. Expected numpy.ndarray or torch.Tensor")
+
+    return pred

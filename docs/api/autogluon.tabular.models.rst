@@ -10,6 +10,107 @@ autogluon.tabular.models
 
    For a stable public API, refer to TabularPredictor.
 
+Model Keys
+-------------------
+
+To fit a model with TabularPredictor, you must specify it in the `TabularPredictor.fit` `hyperparameters` argument.
+
+`hyperparameters` takes in a dictionary of models, where each key is a model name, and the values are a list of dictionaries of model hyperparameters.
+
+For example:
+
+.. code-block:: python
+    hyperparameters = {
+        'NN_TORCH': {},
+        'GBM': [
+            {'extra_trees': True, 'ag_args': {'name_suffix': 'XT'}},
+            {},
+            {
+                "learning_rate": 0.03,
+                "num_leaves": 128,
+                "feature_fraction": 0.9,
+                "min_data_in_leaf": 3,
+                "ag_args": {"name_suffix": "Large", "priority": 0, "hyperparameter_tune_kwargs": None},
+            },
+        ],
+        'CAT': {},
+        'XGB': {},
+        'FASTAI': {},
+        'RF': [{'criterion': 'gini', 'ag_args': {'name_suffix': 'Gini', 'problem_types': ['binary', 'multiclass']}}, {'criterion': 'entropy', 'ag_args': {'name_suffix': 'Entr', 'problem_types': ['binary', 'multiclass']}}, {'criterion': 'squared_error', 'ag_args': {'name_suffix': 'MSE', 'problem_types': ['regression', 'quantile']}}],
+        'XT': [{'criterion': 'gini', 'ag_args': {'name_suffix': 'Gini', 'problem_types': ['binary', 'multiclass']}}, {'criterion': 'entropy', 'ag_args': {'name_suffix': 'Entr', 'problem_types': ['binary', 'multiclass']}}, {'criterion': 'squared_error', 'ag_args': {'name_suffix': 'MSE', 'problem_types': ['regression', 'quantile']}}],
+        'KNN': [{'weights': 'uniform', 'ag_args': {'name_suffix': 'Unif'}}, {'weights': 'distance', 'ag_args': {'name_suffix': 'Dist'}}],
+    }
+
+Here is the mapping of keys to models:
+
+.. code-block:: python
+    MODEL_TYPES = dict(
+        RF=RFModel,
+        XT=XTModel,
+        KNN=KNNModel,
+        GBM=LGBModel,
+        CAT=CatBoostModel,
+        XGB=XGBoostModel,
+        NN_TORCH=TabularNeuralNetTorchModel,
+        LR=LinearModel,
+        FASTAI=NNFastAiTabularModel,
+        TRANSF=TabTransformerModel,
+        AG_TEXT_NN=TextPredictorModel,
+        AG_IMAGE_NN=ImagePredictorModel,
+        AG_AUTOMM=MultiModalPredictorModel,
+
+        FT_TRANSFORMER=FTTransformerModel,
+        TABPFN=TabPFNModel,
+
+        FASTTEXT=FastTextModel,
+        ENS_WEIGHTED=GreedyWeightedEnsembleModel,
+        SIMPLE_ENS_WEIGHTED=SimpleWeightedEnsembleModel,
+
+        # interpretable models
+        IM_RULEFIT=RuleFitModel,
+        IM_GREEDYTREE=GreedyTreeModel,
+        IM_FIGS=FigsModel,
+        IM_HSTREE=HSTreeModel,
+        IM_BOOSTEDRULES=BoostedRulesModel,
+        VW=VowpalWabbitModel,
+
+        DUMMY=DummyModel,
+    )
+
+Here is the mapping of model types to their default names when trained:
+
+.. code-block:: python
+    DEFAULT_MODEL_NAMES = {
+        RFModel: 'RandomForest',
+        XTModel: 'ExtraTrees',
+        KNNModel: 'KNeighbors',
+        LGBModel: 'LightGBM',
+        CatBoostModel: 'CatBoost',
+        XGBoostModel: 'XGBoost',
+        TabularNeuralNetTorchModel: 'NeuralNetTorch',
+        LinearModel: 'LinearModel',
+        NNFastAiTabularModel: 'NeuralNetFastAI',
+        TabTransformerModel: 'Transformer',
+        TextPredictorModel: 'TextPredictor',
+        ImagePredictorModel: 'ImagePredictor',
+        MultiModalPredictorModel: 'MultiModalPredictor',
+
+        FTTransformerModel: 'FTTransformer',
+        TabPFNModel: 'TabPFN',
+
+        FastTextModel: 'FastText',
+        VowpalWabbitModel: 'VowpalWabbit',
+        GreedyWeightedEnsembleModel: 'WeightedEnsemble',
+        SimpleWeightedEnsembleModel: 'WeightedEnsemble',
+
+        # Interpretable models
+        RuleFitModel: 'RuleFit',
+        GreedyTreeModel: 'GreedyTree',
+        FigsModel: 'Figs',
+        HSTreeModel: 'HierarchicalShrinkageTree',
+        BoostedRulesModel: 'BoostedRules',
+    }
+
 Model Name Suffixes
 -------------------
 
@@ -62,9 +163,11 @@ Models
    KNNModel
    LinearModel
    TabularNeuralNetTorchModel
-   TabularNeuralNetMxnetModel
    NNFastAiTabularModel
    VowpalWabbitModel
+   MultiModalPredictorModel
+   TextPredictorModel
+   ImagePredictorModel
 
 :hidden:`AbstractModel`
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -126,12 +229,6 @@ Models
 .. autoclass:: TabularNeuralNetTorchModel
    :members: init
 
-:hidden:`TabularNeuralNetMxnetModel`
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. autoclass:: TabularNeuralNetMxnetModel
-   :members: init
-
 :hidden:`NNFastAiTabularModel`
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -142,6 +239,24 @@ Models
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. autoclass:: VowpalWabbitModel
+   :members: init
+
+:hidden:`MultiModalPredictorModel`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: MultiModalPredictorModel
+   :members: init
+
+:hidden:`TextPredictorModel`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: TextPredictorModel
+   :members: init
+
+:hidden:`ImagePredictorModel`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: ImagePredictorModel
    :members: init
 
 Ensemble Models
@@ -184,24 +299,24 @@ Experimental Models
 .. autosummary::
    :nosignatures:
 
+   FTTransformerModel
+   TabPFNModel
    FastTextModel
-   TextPredictorModel
-   ImagePredictorModel
+
+:hidden:`FTTransformerModel`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: FTTransformerModel
+   :members: init
+
+:hidden:`TabPFNModel`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: TabPFNModel
+   :members: init
 
 :hidden:`FastTextModel`
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. autoclass:: FastTextModel
-   :members: init
-
-:hidden:`TextPredictorModel`
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. autoclass:: TextPredictorModel
-   :members: init
-
-:hidden:`ImagePredictorModel`
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. autoclass:: ImagePredictorModel
    :members: init
