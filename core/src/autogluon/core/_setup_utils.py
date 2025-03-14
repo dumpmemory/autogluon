@@ -4,39 +4,50 @@
 
 import os
 
-AUTOGLUON = 'autogluon'
+AUTOGLUON = "autogluon"
+PACKAGE_NAME = os.getenv("AUTOGLUON_PACKAGE_NAME", AUTOGLUON)
+# TODO: make it more explicit, maybe use another env variable
+LITE_MODE = "lite" in PACKAGE_NAME
 
-AUTOGLUON_ROOT_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..')
-)
+AUTOGLUON_ROOT_PATH = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".."))
 
-PYTHON_REQUIRES = '>=3.7, <3.10'
+PYTHON_REQUIRES = ">=3.9, <3.13"
 
 
 # Only put packages here that would otherwise appear multiple times across different module's setup.py files.
 DEPENDENT_PACKAGES = {
-    # note: if python 3.7 is used, the open CVEs are present: CVE-2021-41496 | CVE-2021-34141; fixes are available in 1.22.x, but python 3.8 only
-    'numpy': '>=1.21,<1.23',
-    'pandas': '>=1.2.5,!=1.4.0,<1.5',
-    'scikit-learn': '>=1.0.0,<1.1',
-    'scipy': '>=1.5.4,<1.8.0',
-    'psutil': '>=5.7.3,<6',
-    'gluoncv': '>=0.10.5,<0.10.6',
-    'tqdm': '>=4.38.0',
-    'Pillow': '>=9.0.1,<9.1.0',
-    'timm': '>=0.5.4,<0.7.0',
+    "boto3": ">=1.10,<2",  # <2 because unlikely to introduce breaking changes in minor releases. >=1.10 because 1.10 is 3 years old, no need to support older
+    "numpy": ">=1.25.0,<2.1.4",  # "<{N+3}" upper cap, where N is the latest released minor version, assuming no warnings using N
+    "pandas": ">=2.0.0,<2.3.0",  # "<{N+3}" upper cap
+    "scikit-learn": ">=1.4.0,<1.5.3",  # capping to latest version
+    "scipy": ">=1.5.4,<1.16",  # "<{N+2}" upper cap
+    "matplotlib": ">=3.7.0,<3.11",  # "<{N+2}" upper cap
+    "psutil": ">=5.7.3,<7.0.0",  # Major version cap
+    "s3fs": ">=2023.1,<2025",  # Yearly cap
+    "networkx": ">=3.0,<4",  # Major version cap
+    "tqdm": ">=4.38,<5",  # Major version cap
+    "Pillow": ">=10.0.1,<12",  # Major version cap
+    "torch": ">=2.2,<2.6",  # Major version cap, sync with common/src/autogluon/common/utils/try_import.py
+    "lightning": ">=2.2,<2.6",  # Major version cap
+    "async_timeout": ">=4.0,<6",  # Major version cap
+    "transformers[sentencepiece]": ">=4.38.0,<5",
+    "accelerate": ">=0.34.0,<1.0",
+    "typing-extensions": ">=4.0,<5",
 }
+if LITE_MODE:
+    DEPENDENT_PACKAGES = {package: version for package, version in DEPENDENT_PACKAGES.items() if package not in ["psutil", "Pillow", "timm"]}
+
 DEPENDENT_PACKAGES = {package: package + version for package, version in DEPENDENT_PACKAGES.items()}
 # TODO: Use DOCS_PACKAGES and TEST_PACKAGES
 DOCS_PACKAGES = []
 TEST_PACKAGES = [
-    'flake8',
-    'pytest',
+    "flake8",
+    "pytest",
 ]
 
 
 def load_version_file():
-    with open(os.path.join(AUTOGLUON_ROOT_PATH, 'VERSION')) as version_file:
+    with open(os.path.join(AUTOGLUON_ROOT_PATH, "VERSION")) as version_file:
         version = version_file.read().strip()
     return version
 
@@ -52,9 +63,10 @@ def update_version(version, use_file_if_exists=True, create_file=False):
     You need to increase the version number after stable release, so that the nightly pypi can work properly.
     """
     try:
-        if not os.getenv('RELEASE'):
+        if not os.getenv("RELEASE"):
             from datetime import date
-            minor_version_file_path = os.path.join(AUTOGLUON_ROOT_PATH, 'VERSION.minor')
+
+            minor_version_file_path = os.path.join(AUTOGLUON_ROOT_PATH, "VERSION.minor")
             if use_file_if_exists and os.path.isfile(minor_version_file_path):
                 with open(minor_version_file_path) as f:
                     day = f.read().strip()
@@ -64,53 +76,56 @@ def update_version(version, use_file_if_exists=True, create_file=False):
             version += day
     except Exception:
         pass
-    if create_file and not os.getenv('RELEASE'):
-        with open(os.path.join(AUTOGLUON_ROOT_PATH, 'VERSION.minor'), 'w') as f:
+    if create_file and not os.getenv("RELEASE"):
+        with open(os.path.join(AUTOGLUON_ROOT_PATH, "VERSION.minor"), "w") as f:
             f.write(day)
     return version
 
 
 def create_version_file(*, version, submodule):
-    print('-- Building version ' + version)
+    print("-- Building version " + version)
     if submodule is not None:
-        version_path = os.path.join(AUTOGLUON_ROOT_PATH, submodule, 'src', AUTOGLUON, submodule, 'version.py')
+        version_path = os.path.join(AUTOGLUON_ROOT_PATH, submodule, "src", AUTOGLUON, submodule, "version.py")
     else:
-        version_path = os.path.join(AUTOGLUON_ROOT_PATH, AUTOGLUON, 'src', AUTOGLUON, 'version.py')
-    with open(version_path, 'w') as f:
+        version_path = os.path.join(AUTOGLUON_ROOT_PATH, AUTOGLUON, "src", AUTOGLUON, "version.py")
+    with open(version_path, "w") as f:
         f.write(f'"""This is the {AUTOGLUON} version file."""\n')
-        f.write("__version__ = '{}'\n".format(version))
+        f.write(f'\n__version__ = "{version}"\n')
+        f.write(f"__lite__ = {LITE_MODE}\n")
 
 
 def default_setup_args(*, version, submodule):
-    from setuptools import find_packages
-    long_description = open(os.path.join(AUTOGLUON_ROOT_PATH, 'README.md')).read()
+    from setuptools import find_namespace_packages
+
+    long_description = open(os.path.join(AUTOGLUON_ROOT_PATH, "README.md")).read()
     if submodule is None:
-        name = AUTOGLUON
+        name = PACKAGE_NAME
     else:
-        name = f'{AUTOGLUON}.{submodule}'
+        name = f"{PACKAGE_NAME}.{submodule}"
+    if os.getenv("RELEASE"):
+        development_status = "Development Status :: 5 - Production/Stable"
+    else:
+        development_status = "Development Status :: 4 - Beta"
     setup_args = dict(
         name=name,
         version=version,
-        author='AutoGluon Community',
-        url='https://github.com/awslabs/autogluon',
-        description='AutoML for Image, Text, and Tabular Data',
+        author="AutoGluon Community",
+        url="https://github.com/autogluon/autogluon",
+        description="Fast and Accurate ML in 3 Lines of Code",
         long_description=long_description,
-        long_description_content_type='text/markdown',
-        license='Apache-2.0',
-        license_files=('../LICENSE', '../NOTICE'),
-
+        long_description_content_type="text/markdown",
+        license="Apache-2.0",
+        license_files=("../LICENSE", "../NOTICE"),
         # Package info
-        packages=find_packages('src'),
-        package_dir={'': 'src'},
+        packages=find_namespace_packages("src", include=["autogluon.*"]),
+        package_dir={"": "src"},
         namespace_packages=[AUTOGLUON],
         zip_safe=True,
         include_package_data=True,
         python_requires=PYTHON_REQUIRES,
-        package_data={AUTOGLUON: [
-            'LICENSE',
-        ]},
+        package_data={AUTOGLUON: ["LICENSE"]},
         classifiers=[
-            "Development Status :: 4 - Beta",
+            development_status,
             "Intended Audience :: Education",
             "Intended Audience :: Developers",
             "Intended Audience :: Science/Research",
@@ -123,20 +138,21 @@ def default_setup_args(*, version, submodule):
             "Operating System :: Microsoft :: Windows",
             "Operating System :: POSIX",
             "Operating System :: Unix",
-            'Programming Language :: Python :: 3',
-            "Programming Language :: Python :: 3.7",
-            "Programming Language :: Python :: 3.8",
+            "Programming Language :: Python :: 3",
             "Programming Language :: Python :: 3.9",
+            "Programming Language :: Python :: 3.10",
+            "Programming Language :: Python :: 3.11",
+            "Programming Language :: Python :: 3.12",
             "Topic :: Software Development",
             "Topic :: Scientific/Engineering :: Artificial Intelligence",
             "Topic :: Scientific/Engineering :: Information Analysis",
             "Topic :: Scientific/Engineering :: Image Recognition",
         ],
         project_urls={
-            'Documentation': 'https://auto.gluon.ai',
-            'Bug Reports': 'https://github.com/awslabs/autogluon/issues',
-            'Source': 'https://github.com/awslabs/autogluon/',
-            'Contribute!': 'https://github.com/awslabs/autogluon/blob/master/CONTRIBUTING.md',
+            "Documentation": "https://auto.gluon.ai",
+            "Bug Reports": "https://github.com/autogluon/autogluon/issues",
+            "Source": "https://github.com/autogluon/autogluon/",
+            "Contribute!": "https://github.com/autogluon/autogluon/blob/master/CONTRIBUTING.md",
         },
     )
     return setup_args

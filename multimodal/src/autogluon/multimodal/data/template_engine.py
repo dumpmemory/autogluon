@@ -1,13 +1,11 @@
 import logging
 
 import numpy as np
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
-from autogluon.multimodal.data.templates import DatasetTemplates, Template, TemplateCollection
+from .templates import DatasetTemplates, Template, TemplateCollection
 
-from ..constants import AUTOMM
-
-logger = logging.getLogger(AUTOMM)
+logger = logging.getLogger(__name__)
 
 
 class TemplateEngine:
@@ -15,7 +13,7 @@ class TemplateEngine:
     Class to manage the selection and use of templates.
     """
 
-    def __init__(self, template_config: dict):
+    def __init__(self, template_config: DictConfig):
         """
         Initialize the TemplateEngine using preset templates from existing datasets or custom templates specified in config config.data.templates, if specified.
 
@@ -28,10 +26,10 @@ class TemplateEngine:
         self.template_config = template_config
         collection = TemplateCollection()
         self.all_datasets = collection.keys
-        self.preset_templates = OmegaConf.select(self.template_config, "preset_templates", default=None)
-        self.custom_templates = OmegaConf.select(self.template_config, "custom_templates", default=None)
-        self.num_templates = OmegaConf.select(self.template_config, "num_templates", default=30)
-        self.template_length = OmegaConf.select(self.template_config, "template_length", default=2048)
+        self.preset_templates = self.template_config.preset_templates
+        self.custom_templates = self.template_config.custom_templates
+        self.num_templates = self.template_config.num_templates
+        self.template_length = self.template_config.template_length
 
         if self.preset_templates:
             assert (
@@ -56,6 +54,21 @@ class TemplateEngine:
 
     def get_templates(self):
         return self.templates
+
+    def get_max_choice_length(self, tokenizer):
+        text = {}
+        max_length = 0
+        for template in self.templates:
+            answer_choices = template.get_answer_choices_list(text)
+            for choice in answer_choices:
+                answer_ids = tokenizer(
+                    choice,
+                )["input_ids"]
+                curr_length = len(answer_ids)
+                if curr_length > max_length:
+                    max_length = curr_length
+
+        return max_length
 
     def sample_and_apply_template(self, example: dict):
         """

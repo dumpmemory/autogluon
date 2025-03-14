@@ -1,8 +1,9 @@
 import numpy as np
+import pandas as pd
 
 
 def compute_conformity_score(y_val_pred: np.ndarray, y_val: np.ndarray, quantile_levels: list):
-    '''
+    """
     Compute conformity scores based on validation set. This is only applicable to quantile regression problems.
     The scores are used to conformalize new quantile predictions.
     This is based on the paper 'Conformalized Quantile Regression (https://arxiv.org/abs/1905.03222)',
@@ -20,12 +21,15 @@ def compute_conformity_score(y_val_pred: np.ndarray, y_val: np.ndarray, quantile
         List of quantile levels
     Return:
     numpy ndarray: values to conformalize the new quantile predictions
-    '''
+    """
 
     num_samples = y_val.shape[0]
     y_val = y_val.reshape(-1)
     assert y_val_pred.shape[0] == num_samples
     assert y_val_pred.shape[1] == len(quantile_levels)
+
+    if isinstance(y_val_pred, pd.DataFrame):
+        y_val_pred = y_val_pred.to_numpy()
 
     conformalize_list = []
     for i, q in enumerate(quantile_levels):
@@ -40,7 +44,7 @@ def compute_conformity_score(y_val_pred: np.ndarray, y_val: np.ndarray, quantile
             error_low = np.sort(error_low, 0)
             index_low = int(np.ceil((1 - q) * (num_samples + 1))) - 1
             index_low = min(max(index_low, 0), num_samples - 1)
-            conformalize = - error_low[index_low]
+            conformalize = -error_low[index_low]
         else:
             conformalize = 0.0
         conformalize_list.append(conformalize)

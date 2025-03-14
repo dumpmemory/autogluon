@@ -3,17 +3,19 @@ import logging
 import numpy as np
 from sklearn.model_selection import ParameterSampler
 
-from .local_searcher import LocalSearcher
-from .exceptions import ExhaustedSearchSpaceError
-from ..space import DiscreteSpace, Space
+from autogluon.common import space
 
-__all__ = ['LocalRandomSearcher']
+from .exceptions import ExhaustedSearchSpaceError
+from .local_searcher import LocalSearcher
+
+__all__ = ["LocalRandomSearcher"]
 
 logger = logging.getLogger(__name__)
 
 
 class LocalRandomSearcher(LocalSearcher):
     """Searcher which randomly samples configurations to try next."""
+
     MAX_RETRIES = 100
 
     def __init__(self, *, first_is_default=True, random_seed=0, **kwargs):
@@ -27,7 +29,7 @@ class LocalRandomSearcher(LocalSearcher):
     def _get_params_space(self) -> dict:
         param_space = dict()
         for key, val in self.search_space.items():
-            if isinstance(val, Space):
+            if isinstance(val, space.Space):
                 sk = val.convert_to_sklearn()
                 param_space[key] = sk
         return param_space
@@ -35,8 +37,8 @@ class LocalRandomSearcher(LocalSearcher):
     def _get_num_configs(self) -> int:
         num_unique = 1
         for key, val in self.search_space.items():
-            if isinstance(val, Space):
-                if isinstance(val, DiscreteSpace):
+            if isinstance(val, space.Space):
+                if isinstance(val, space.DiscreteSpace):
                     num_unique *= len(val)
                 else:
                     num_unique = None
@@ -69,7 +71,7 @@ class LocalRandomSearcher(LocalSearcher):
             if num_tries > self.MAX_RETRIES:
                 if self._num_configs is not None:
                     num_results = len(self._results)
-                    logger.log(30, f'Stopping HPO due to exhausted search space: {num_results} of {self._num_configs} possible configs ran.')
+                    logger.log(30, f"Stopping HPO due to exhausted search space: {num_results} of {self._num_configs} possible configs ran.")
                     raise ExhaustedSearchSpaceError
                 assert num_tries <= self.MAX_RETRIES, f"Cannot find new config in LocalRandomSearcher, even after {self.MAX_RETRIES} trials"
             new_config = self._sample_config()

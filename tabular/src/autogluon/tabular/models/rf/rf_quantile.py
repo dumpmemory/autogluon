@@ -35,16 +35,13 @@
 # DAMAGE.
 
 import logging
-import pandas as pd
-import numpy as np
 from functools import partial
-from sklearn.tree import BaseDecisionTree
-from sklearn.tree import DecisionTreeRegressor
-from sklearn.tree import ExtraTreeRegressor
+
+import numpy as np
+import pandas as pd
 from sklearn.ensemble._forest import ForestRegressor
-from sklearn.utils import check_array
-from sklearn.utils import check_X_y
-from sklearn.utils import check_random_state
+from sklearn.tree import BaseDecisionTree, DecisionTreeRegressor, ExtraTreeRegressor
+from sklearn.utils import check_array, check_random_state, check_X_y
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +163,7 @@ class BaseTreeQuantileRegressor(BaseDecisionTree):
             quantiles[X_leaves == leaf] = weighted_percentile(self.y_train_[self.y_train_leaves_ == leaf], quantile)
         return quantiles
 
-    def fit(self, X, y, sample_weight=None, check_input=True, X_idx_sorted=None):
+    def fit(self, X, y, sample_weight=None, check_input=True):
         """
         Build a decision tree classifier from the training set (X, y).
 
@@ -191,12 +188,6 @@ class BaseTreeQuantileRegressor(BaseDecisionTree):
             Allow to bypass several input checking.
             Don't use this parameter unless you know what you do.
 
-        X_idx_sorted : array-like, shape = [n_samples, n_features], optional
-            The indexes of the sorted training input samples. If many tree
-            are grown on the same dataset, this allows the ordering to be
-            cached between trees. If None, the data will be sorted here.
-            Don't use this parameter unless you know what to do.
-
         Returns
         -------
         self : object
@@ -210,9 +201,7 @@ class BaseTreeQuantileRegressor(BaseDecisionTree):
 
         # apply method requires X to be of dtype np.float32
         X, y = check_X_y(X, y, accept_sparse="csc", dtype=np.float32, multi_output=False)
-        super(BaseTreeQuantileRegressor, self).fit(
-            X, y, sample_weight=sample_weight, check_input=check_input, X_idx_sorted=X_idx_sorted
-        )
+        super(BaseTreeQuantileRegressor, self).fit(X, y, sample_weight=sample_weight, check_input=check_input)
         self.y_train_ = y
 
         # Stores the leaf nodes that the samples lie in.
@@ -220,7 +209,7 @@ class BaseTreeQuantileRegressor(BaseDecisionTree):
         return self
 
 
-class DecisionTreeQuantileRegressor(DecisionTreeRegressor, BaseTreeQuantileRegressor):
+class DecisionTreeQuantileRegressor(BaseTreeQuantileRegressor, DecisionTreeRegressor):
     """A decision tree regressor that provides quantile estimates.
 
     Parameters
@@ -345,7 +334,7 @@ class DecisionTreeQuantileRegressor(DecisionTreeRegressor, BaseTreeQuantileRegre
         )
 
 
-class ExtraTreeQuantileRegressor(ExtraTreeRegressor, BaseTreeQuantileRegressor):
+class ExtraTreeQuantileRegressor(BaseTreeQuantileRegressor, ExtraTreeRegressor):
     def __init__(
         self,
         criterion="squared_error",
@@ -353,7 +342,7 @@ class ExtraTreeQuantileRegressor(ExtraTreeRegressor, BaseTreeQuantileRegressor):
         max_depth=None,
         min_samples_split=2,
         min_samples_leaf=1,
-        max_features="auto",
+        max_features=1.0,
         random_state=None,
         max_leaf_nodes=None,
     ):
@@ -451,7 +440,7 @@ def get_quantiles(neighbors_df, quantile_levels):
     Parameters
     ----------
     neighbors_df : pd.DataFrame
-        DataFrame with columns y (target values for each sample) and weight (weigth assigned to each sample)
+        DataFrame with columns y (target values for each sample) and weight (weight assigned to each sample)
     quantile_levels : List[float]
         List of quantiles to predict between 0.0 and 1.0
 
@@ -521,6 +510,10 @@ class BaseForestQuantileRegressor(ForestRegressor):
                 bootstrap_indices = np.arange(len(y))
 
             est_weights = np.bincount(bootstrap_indices, minlength=len(y))
+            # FIXME: When updating from scikit-learn 1.3.2 to 1.4.0, BaseTreeQuantileRegressor.fit is not called
+            # Re-calculating y_train_ and y_train_leaves_ to resolve this issue
+            est.y_train_ = y
+            est.y_train_leaves_ = est.tree_.apply(X)
             y_train_leaves = est.y_train_leaves_
             # Normalize the bootstrap weights such that the total weight of each leaf sums up to 1
             # Relabel leaves starting from zero in order to efficiently count the total sum per leaf with bincount
@@ -562,9 +555,7 @@ class BaseForestQuantileRegressor(ForestRegressor):
         samples_with_weighted_neighbors = get_weighted_neighbors_dataframe(
             X_leaves=X_leaves, y_train_leaves=self.y_train_leaves_, y_train=self.y_train_, y_weights=self.y_weights_
         )
-        quantile_preds = samples_with_weighted_neighbors.groupby("item_id").apply(
-            partial(get_quantiles, quantile_levels=quantile_levels)
-        )
+        quantile_preds = samples_with_weighted_neighbors.groupby("item_id").apply(partial(get_quantiles, quantile_levels=quantile_levels), include_groups=False)
         return np.stack(quantile_preds.values.tolist())
 
 
@@ -683,7 +674,7 @@ class RandomForestQuantileRegressor(BaseForestQuantileRegressor):
         max_depth=None,
         min_samples_split=2,
         min_samples_leaf=1,
-        max_features="auto",
+        max_features=1.0,
         max_leaf_nodes=None,
         bootstrap=True,
         oob_score=False,
@@ -694,7 +685,7 @@ class RandomForestQuantileRegressor(BaseForestQuantileRegressor):
         max_samples=None,
     ):
         super(RandomForestQuantileRegressor, self).__init__(
-            base_estimator=DecisionTreeQuantileRegressor(),
+            DecisionTreeQuantileRegressor(),
             n_estimators=n_estimators,
             estimator_params=(
                 "criterion",
@@ -835,7 +826,7 @@ class ExtraTreesQuantileRegressor(BaseForestQuantileRegressor):
         max_depth=None,
         min_samples_split=2,
         min_samples_leaf=1,
-        max_features="auto",
+        max_features=1.0,
         max_leaf_nodes=None,
         bootstrap=True,
         oob_score=False,
@@ -846,7 +837,7 @@ class ExtraTreesQuantileRegressor(BaseForestQuantileRegressor):
         max_samples=None,
     ):
         super(ExtraTreesQuantileRegressor, self).__init__(
-            base_estimator=ExtraTreeQuantileRegressor(),
+            ExtraTreeQuantileRegressor(),
             n_estimators=n_estimators,
             estimator_params=(
                 "criterion",

@@ -1,11 +1,14 @@
-from typing import List, Optional
+import logging
+from typing import Dict, List, Optional
 
 from torch import nn
 
 from ..constants import FEATURES, LABEL, LOGITS, NUMERICAL
+from .ft_transformer import NumEmbeddings
 from .mlp import MLP
-from .numerical_transformer import NumEmbeddings
 from .utils import init_weights
+
+logger = logging.getLogger(__name__)
 
 
 class NumericalMLP(nn.Module):
@@ -21,11 +24,12 @@ class NumericalMLP(nn.Module):
         out_features: Optional[int] = None,
         num_layers: Optional[int] = 1,
         activation: Optional[str] = "leaky_relu",
-        dropout_prob: Optional[float] = 0.5,
+        dropout: Optional[float] = 0.5,
         normalization: Optional[str] = "layer_norm",
         num_classes: Optional[int] = 0,
-        d_token: Optional[int] = 8,
+        token_dim: Optional[int] = 8,
         embedding_arch: Optional[List[str]] = None,
+        numerical_fill_values: Optional[Dict] = None,
     ):
         """
         Parameters
@@ -42,13 +46,13 @@ class NumericalMLP(nn.Module):
             Number of MLP layers.
         activation
             Name of activation function.
-        dropout_prob
+        dropout
             Dropout probability.
         normalization
             Name of normalization function.
         num_classes
             Number of classes. 1 for a regression task.
-        d_token
+        token_dim
             The size of one token for `NumericalEmbedding`.
         embedding_arch
             A list containing the names of embedding layers.
@@ -56,19 +60,21 @@ class NumericalMLP(nn.Module):
             {'linear', 'shared_linear', 'autodis', 'positional', 'relu', 'layernorm'}
         """
         super().__init__()
+        logger.debug(f"initializing {prefix} (NumericalMLP)")
         self.out_features = out_features
+        self.numerical_fill_values = numerical_fill_values
 
         self.numerical_feature_tokenizer = (
             NumEmbeddings(
                 in_features=in_features,
-                d_embedding=d_token,
+                d_embedding=token_dim,
                 embedding_arch=embedding_arch,
             )
             if embedding_arch is not None
             else nn.Identity()
         )
 
-        in_features = in_features * d_token if embedding_arch is not None else in_features
+        in_features = in_features * token_dim if embedding_arch is not None else in_features
 
         self.mlp = MLP(
             in_features=in_features,
@@ -76,7 +82,7 @@ class NumericalMLP(nn.Module):
             out_features=out_features,
             num_layers=num_layers,
             activation=activation,
-            dropout_prob=dropout_prob,
+            dropout=dropout,
             normalization=normalization,
         )
         self.head = nn.Linear(out_features, num_classes) if num_classes > 0 else nn.Identity()
@@ -91,6 +97,10 @@ class NumericalMLP(nn.Module):
     @property
     def numerical_key(self):
         return f"{self.prefix}_{NUMERICAL}"
+
+    @property
+    def input_keys(self):
+        return [self.numerical_key]
 
     @property
     def label_key(self):
